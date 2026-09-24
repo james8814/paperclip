@@ -204,13 +204,21 @@ describe("managed install commands", () => {
     expect(uiPackCall).toBeDefined();
   });
 
-  it("resolves the complete server workspace dependency closure in dependency order", () => {
+  it("resolves the server and CLI workspace dependency closures in dependency order", () => {
     const checkout = path.join(root, "checkout");
     const packages = [
       { dir: "packages/shared", name: "@paperclipai/shared", dependencies: {} },
       { dir: "packages/db", name: "@paperclipai/db", dependencies: { "@paperclipai/shared": "workspace:*" } },
       { dir: "server", name: "@paperclipai/server", dependencies: { "@paperclipai/db": "workspace:*" } },
+      { dir: "packages/cli-extra", name: "@paperclipai/cli-extra", dependencies: { "@paperclipai/shared": "workspace:*" } },
+      { dir: "packages/unused", name: "@paperclipai/unused", dependencies: {} },
     ];
+    fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({
+      name: "paperclipai",
+      dependencies: { "@paperclipai/server": "workspace:*", "@paperclipai/cli-extra": "workspace:*" },
+      devDependencies: { "@paperclipai/unused": "workspace:*" },
+    }));
     fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
     fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
     for (const workspacePackage of packages) {
@@ -222,6 +230,7 @@ describe("managed install commands", () => {
       "@paperclipai/shared",
       "@paperclipai/db",
       "@paperclipai/server",
+      "@paperclipai/cli-extra",
     ]);
   });
 

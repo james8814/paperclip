@@ -53,6 +53,9 @@ export async function runCommandWithDiagnostics(
   }
 }
 
+// The payload needs every workspace package the CLI installs: the server's dependency closure plus
+// the CLI's own runtime @paperclipai dependencies. The CLI is packed with plain `npm pack`, which
+// does not rewrite `workspace:` ranges, so each of these must be staged as a local tarball.
 export function resolveGitInstallWorkspacePackages(checkoutPath: string): ReleasePackageEntry[] {
   const manifestPath = path.join(checkoutPath, "scripts", "release-package-manifest.json");
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as ReleasePackageEntry[];
@@ -61,6 +64,13 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   const visited = new Set<string>();
   const ordered: ReleasePackageEntry[] = [];
 
+  const runtimeWorkspaceDependencies = (packageJson: Record<string, unknown>): string[] =>
+    (["dependencies", "optionalDependencies", "peerDependencies"] as const).flatMap((section) => {
+      const dependencies = packageJson[section];
+      if (!dependencies || typeof dependencies !== "object") return [];
+      return Object.keys(dependencies).filter((dependencyName) => dependencyName.startsWith("@paperclipai/"));
+    });
+
   const visit = (packageName: string): void => {
     if (visited.has(packageName)) return;
     if (visiting.has(packageName)) throw new Error(`Circular workspace dependency while staging ${packageName}.`);
@@ -68,19 +78,15 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
     if (!entry) throw new Error(`Git install cannot stage workspace dependency ${packageName}; it is missing from scripts/release-package-manifest.json.`);
     visiting.add(packageName);
     const packageJson = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as Record<string, unknown>;
-    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
-      const dependencies = packageJson[section];
-      if (!dependencies || typeof dependencies !== "object") continue;
-      for (const dependencyName of Object.keys(dependencies)) {
-        if (dependencyName.startsWith("@paperclipai/")) visit(dependencyName);
-      }
-    }
+    for (const dependencyName of runtimeWorkspaceDependencies(packageJson)) visit(dependencyName);
     visiting.delete(packageName);
     visited.add(packageName);
     ordered.push(entry);
   };
 
   visit("@paperclipai/server");
+  const cliPackageJson = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as Record<string, unknown>;
+  for (const dependencyName of runtimeWorkspaceDependencies(cliPackageJson)) visit(dependencyName);
   return ordered;
 }
 
