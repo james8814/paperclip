@@ -84,6 +84,30 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   return ordered;
 }
 
+// Workspace packages carry independent versions in source (plugin-sdk is 1.0.0), but packing rewrites
+// workspace:* to the dependency's own version. release.sh unifies them with release-package-map.mjs
+// set-version, but that script validates every public package in the repo. Rewrite only the packages
+// this install packs, so an unrelated fork package cannot stop the install.
+export function unifyGitInstallWorkspaceVersions(checkoutPath: string, workspacePackages: ReleasePackageEntry[], version: string): void {
+  const stagedNames = new Set(workspacePackages.map((entry) => entry.name));
+  const packageDirs = [...workspacePackages.map((entry) => entry.dir), "cli"];
+  for (const packageDir of packageDirs) {
+    const packageJsonPath = path.join(checkoutPath, packageDir, "package.json");
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as Record<string, unknown>;
+    packageJson.version = version;
+    for (const section of ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"] as const) {
+      const dependencies = packageJson[section];
+      if (!dependencies || typeof dependencies !== "object") continue;
+      for (const [dependencyName, range] of Object.entries(dependencies as Record<string, unknown>)) {
+        if (stagedNames.has(dependencyName) && typeof range === "string" && range.startsWith("workspace:")) {
+          (dependencies as Record<string, unknown>)[dependencyName] = version;
+        }
+      }
+    }
+    fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+  }
+}
+
 export function assertSupportedNodeVersion(): void {
   if (!isSupportedNodeVersion(process.versions.node)) {
     throw new Error(`Installing or updating Paperclip requires Node.js ${MINIMUM_NODE_VERSION} or newer (found ${process.version} at ${process.execPath}). Put a supported Node bin directory first on PATH and run 'npx paperclipai@latest install --yes' to re-pin an existing managed install.`);
@@ -289,10 +313,8 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       fs.cpSync(path.join(checkoutPath, "skills"), path.join(checkoutPath, packageDir, "skills"), { recursive: true });
     }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
-    // Workspace packages carry independent versions in source (plugin-sdk is 1.0.0), but packing
-    // rewrites workspace:* to the depending package's own version. Unify them first, as release.sh does.
-    await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "release-package-map.mjs"), "set-version", metadata.version], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    unifyGitInstallWorkspaceVersions(checkoutPath, workspacePackages, metadata.version);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
