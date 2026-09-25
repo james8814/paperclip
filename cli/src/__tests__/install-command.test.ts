@@ -209,7 +209,7 @@ describe("managed install commands", () => {
     const packages = [
       { dir: "packages/shared", name: "@paperclipai/shared", dependencies: {} },
       { dir: "packages/db", name: "@paperclipai/db", dependencies: { "@paperclipai/shared": "workspace:*" } },
-      { dir: "server", name: "@paperclipai/server", dependencies: { "@paperclipai/db": "workspace:*" } },
+      { dir: "server", name: "@paperclipai/server", dependencies: { "@paperclipai/db": "workspace:*", "@paperclipai/published": "^2.0.0" } },
       { dir: "packages/cli-extra", name: "@paperclipai/cli-extra", dependencies: { "@paperclipai/shared": "workspace:*" } },
       { dir: "packages/unused", name: "@paperclipai/unused", dependencies: {} },
     ];
@@ -217,6 +217,7 @@ describe("managed install commands", () => {
     fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({
       name: "paperclipai",
       dependencies: { "@paperclipai/server": "workspace:*", "@paperclipai/cli-extra": "workspace:*" },
+      optionalDependencies: { "@paperclipai/registry-only": "^1.0.0" },
       devDependencies: { "@paperclipai/unused": "workspace:*" },
     }));
     fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });

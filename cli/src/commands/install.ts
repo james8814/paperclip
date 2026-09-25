@@ -68,7 +68,11 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
     (["dependencies", "optionalDependencies", "peerDependencies"] as const).flatMap((section) => {
       const dependencies = packageJson[section];
       if (!dependencies || typeof dependencies !== "object") return [];
-      return Object.keys(dependencies).filter((dependencyName) => dependencyName.startsWith("@paperclipai/"));
+      // Only workspace ranges need a local tarball. A registry range (for example a published optional
+      // dependency a fork declares) installs from the registry and may not be in the release manifest.
+      return Object.entries(dependencies as Record<string, unknown>)
+        .filter(([dependencyName, range]) => dependencyName.startsWith("@paperclipai/") && typeof range === "string" && range.startsWith("workspace:"))
+        .map(([dependencyName]) => dependencyName);
     });
 
   const visit = (packageName: string): void => {
