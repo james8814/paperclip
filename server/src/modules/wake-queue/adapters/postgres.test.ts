@@ -336,9 +336,17 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
     const before = (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
     const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
-    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
-    const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => { throw new Error("must not restart the outgoing owner"); });
+    // The drain may still run for other agents' wakes; it must not restart the outgoing owner.
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+      },
+    });
+    const result = await release({ companyId, runId, now: new Date() });
     expect(result).toMatchObject({ outcome: { kind: "released" }, postCommitEffects: [] });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({
       status: "in_progress", statusVersion: before.statusVersion, assigneeAgentId: agentId, executionRunId: null, checkoutRunId: null,
     });
