@@ -7534,6 +7534,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true },
     });
     await db.update(issues).set({ assigneeAgentId: newAgentId }).where(eq(issues.id, issueId));
+    // An older wake from a third agent is parked behind the same execution.
+    const mentionedAgentId = randomUUID();
+    await db.insert(agents).values({ id: mentionedAgentId, companyId, name: "Mentioned", role: "engineer",
+      status: "idle", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(agentWakeupRequests).values({ companyId, agentId: mentionedAgentId, source: "automation",
+      reason: "issue_comment_mentioned", status: "deferred_issue_execution", requestedAt: new Date(Date.now() - 60_000),
+      requestedByActorType: "agent", requestedByActorId: agentId, payload: { issueId } });
     const [handoff] = await db.insert(issueComments).values({
       companyId, issueId, authorAgentId: agentId, createdByRunId: runId, body: "Over to you",
     }).returning();

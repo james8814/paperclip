@@ -114,6 +114,8 @@ export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
   findNextDeferredWake(input: {
     companyId: string; issueId: string; excludedWakeIds?: string[]; excludedAgentId?: string;
+    /** Read this agent's wakes before others, then in request order. */
+    preferredAgentId?: string;
   }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;

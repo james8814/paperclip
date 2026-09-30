@@ -157,7 +157,10 @@ async function runReleaseDrain(
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
       ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
-      ...(locked.otherAgentsOnly ? { excludedAgentId: run.agentId } : {}),
+      // One wake is promoted per release: the handoff's new assignee goes first.
+      ...(locked.otherAgentsOnly
+        ? { excludedAgentId: run.agentId, ...(issue.assigneeAgentId ? { preferredAgentId: issue.assigneeAgentId } : {}) }
+        : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
