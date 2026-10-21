@@ -129,6 +129,7 @@ import {
   type IssueWakeDiagnosticActivityRecord,
   type IssueWakeDiagnosticEvent,
   type IssueWakeDiagnosticWakeFailureClass,
+  type IssueWakeDiagnosticWakeGate,
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
@@ -1418,6 +1419,13 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "execution_review_requested",
+  "execution_approval_requested",
+  "execution_changes_requested",
+  "agent.not_invokable",
+  "budget.blocked",
+  "company.inactive",
+  "execution_reconciliation_required",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -1452,6 +1460,94 @@ function projectWakeDiagnosticStatus(value: string) {
   return ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES.has(value) ? value : "other";
 }
 
+// Project only native gate enums; never pass raw error or executionWait
+// message text through to the requester.
+function projectWakeGate(row: {
+  status: string;
+  reason: string | null;
+  payload: unknown;
+}): IssueWakeDiagnosticWakeGate | null {
+  const payload =
+    row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+      ? (row.payload as Record<string, unknown>)
+      : {};
+  const waitRaw = payload.executionWait;
+  const wait =
+    waitRaw && typeof waitRaw === "object" && !Array.isArray(waitRaw)
+      ? (waitRaw as Record<string, unknown>)
+      : {};
+  const agentReasonRaw = wait.agentReason ?? wait.reason;
+  const reason = projectWakeDiagnosticReason(
+    row.status === "deferred_issue_execution"
+      ? typeof agentReasonRaw === "string"
+        ? agentReasonRaw
+        : null
+      : row.reason,
+  );
+  const agentReasons = new Set([
+    "paused",
+    "terminated",
+    "pending_approval",
+    "unknown_status",
+    "manager_terminated",
+    "reporting_cycle",
+    "manager_missing",
+  ]);
+  if (reason === "agent.not_invokable") {
+    const code =
+      typeof agentReasonRaw === "string" && agentReasons.has(agentReasonRaw)
+        ? agentReasonRaw
+        : "agent.not_invokable";
+    return {
+      code,
+      owner: "agent_admin",
+      nextAction:
+        "An authorized agent administrator must inspect the agent state and reporting chain, resolve the recorded block, then continue the current task through its native execution stage.",
+    };
+  }
+  if (reason === "budget.blocked") {
+    return {
+      code: "budget.blocked",
+      owner: "budget_owner",
+      nextAction:
+        "The authorized budget owner must inspect and resolve the budget block, then continue the current task through its native execution stage.",
+    };
+  }
+  if (reason === "company.inactive") {
+    return {
+      code: "company.inactive",
+      owner: "company_admin",
+      nextAction:
+        "An authorized company administrator must inspect the company lifecycle state; continue the task only after execution is permitted.",
+    };
+  }
+  if (reason === "heartbeat.wakeOnDemand.disabled") {
+    return {
+      code: "heartbeat.wakeOnDemand.disabled",
+      owner: "agent_admin",
+      nextAction:
+        "The authorized agent administrator must confirm the event-wake policy before enabling or continuing execution. A saved receipt does not authorize a policy change.",
+    };
+  }
+  if (reason === "execution_reconciliation_required") {
+    return {
+      code: "execution_reconciliation_required",
+      owner: "recovery_owner",
+      nextAction:
+        "Inspect this task's recovery action and stopped run, reconcile recorded outcomes through the native recovery action, and use its authorized continuation.",
+    };
+  }
+  return null;
+}
+
+function wakeDiagnosticNextAction(
+  event: IssueWakeDiagnosticWakeRequest,
+): string {
+  return event.gate
+    ? ` Next action (${event.gate.owner}): ${event.gate.nextAction}`
+    : "";
+}
+
 function wakeFailureClass(
   status: string,
   rawError: string | null,
@@ -1474,6 +1570,7 @@ function projectIssueWakeRequest(
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload: unknown;
   },
   options: { includeInternalIds: boolean },
 ): IssueWakeDiagnosticWakeRequest {
@@ -1490,6 +1587,7 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    gate: projectWakeGate(row),
   };
 }
 
@@ -1613,7 +1711,7 @@ function buildIssueWakeDiagnosis(input: {
           : "";
       return `The most recent wake for ${blockerDiagnosticLabel(input.issue)} was ${latest.status}${wakeDiagnosticReasonPhrase(
         latest.reason,
-      )}${coalesced}.`;
+      )}${coalesced}.${wakeDiagnosticNextAction(latest)}`;
     }
     if (latest.status === "queued" || latest.status === "claimed") {
       return `The most recent wake for ${blockerDiagnosticLabel(input.issue)} is currently ${latest.status}${wakeDiagnosticReasonPhrase(

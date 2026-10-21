@@ -265,6 +265,13 @@ export interface IssueBlockerDiagnosticsResponse {
 
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";
 
+/** Projection of a native wake gate: enum code plus the owner and next action. */
+export interface IssueWakeDiagnosticWakeGate {
+  code: string;
+  owner: string;
+  nextAction: string;
+}
+
 export interface IssueWakeDiagnosticWakeRequest {
   kind: "wake_request";
   agentId: string | null;
@@ -277,6 +284,7 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  gate: IssueWakeDiagnosticWakeGate | null;
 }
 
 export interface IssueWakeDiagnosticActivityRecord {

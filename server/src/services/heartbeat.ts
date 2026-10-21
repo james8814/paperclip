@@ -63,7 +63,12 @@ import {
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
-import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import {
+  buildExecutionContinuation,
+  ExecutionContinuationContextError,
+  StaleExecutionContinuationError,
+} from "./execution-continuation.js";
+import { classifyDeferredExecutionWake } from "../modules/wake-queue/domain/context.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -856,6 +861,8 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
   "chat_failed_run_retry_not_authorized",
+  "continuation_source_context_missing",
+  "continuation_user_authorization_missing",
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
 ]);
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
@@ -869,6 +876,7 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
 ]);
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  if (error instanceof ExecutionContinuationContextError) return error.code;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
   if (
@@ -3783,6 +3791,10 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    executionStageId?: string;
+    executionStateStatus?: "pending" | "changes_requested";
+    requireNoAgentIssueRun?: boolean;
+    agentIssueRunCreatedAtGte?: Date | string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -19690,11 +19702,78 @@ export function heartbeatService(
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        ),
+        sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+
+        and(
+          eq(agentWakeupRequests.source, "assignment"),
+          inArray(agentWakeupRequests.reason, [
+            "execution_review_requested",
+            "execution_approval_requested",
+            "execution_changes_requested",
+          ]),
+        ),
+        and(
+          eq(agentWakeupRequests.source, "automation"),
+          eq(agentWakeupRequests.requestedByActorType, "system"),
+          inArray(agentWakeupRequests.reason, [
+            "run_liveness_continuation",
+            "issue_continuation_needed",
+          ]),
+        ),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
+      const savedIssue = await getIssueExecutionContext(wake.companyId, String(wake.payload?.issueId));
+      const executionKind = savedIssue ? classifyDeferredExecutionWake(wake, savedIssue) : null;
+      if (executionKind) {
+        const savedAgent = await getAgent(wake.agentId);
+        const invokable = savedAgent
+          ? await getAgentInvokability(savedAgent)
+          : { invokable: false, reason: "missing" };
+        const block = await budgets.getInvocationBlock(wake.companyId, wake.agentId, {
+          issueId: savedIssue.id,
+          projectId: savedIssue.projectId,
+        });
+        const waitReason = !invokable.invokable
+          ? "agent.not_invokable"
+          : block
+            ? "budget.blocked"
+            : !parseHeartbeatPolicy(savedAgent).wakeOnDemand
+              ? "heartbeat.wakeOnDemand.disabled"
+              : null;
+        if (waitReason) {
+          await db.update(agentWakeupRequests).set({
+            payload: {
+              ...parseObject(wake.payload),
+              executionWait: { reason: waitReason, agentReason: invokable.reason ?? null },
+            },
+            updatedAt: new Date(),
+          }).where(and(
+            eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ));
+          continue;
+        }
+        const [holder] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, wake.companyId),
+          executionKind === "continuation" ? eq(heartbeatRuns.agentId, wake.agentId) : undefined,
+          or(eq(heartbeatRuns.nativeIssueId, savedIssue.id),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${savedIssue.id}`),
+          inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out", "cancelled", "interrupted"]),
+        )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+        if (holder) {
+          const released = await wakeQueue.releaseIssueExecution({
+            companyId: wake.companyId,
+            runId: holder.id,
+            now: new Date(),
+            deferredExecutionWakeId: wake.id,
+          });
+          await applyWakeQueuePostCommitEffects(released.postCommitEffects);
+        }
+        continue;
+      }
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
@@ -26542,6 +26621,9 @@ export function heartbeatService(
             },
           } : null) ??
           workspaceValidationSetupFailure?.resultJson ??
+          (outerErr instanceof ExecutionContinuationContextError
+            ? outerErr.resultJson
+            : null) ??
           configurationIncompleteSetupFailure?.resultJson ??
           (unresolvedBaseRefSetupFailure
             ? buildUnresolvedWorkspaceBaseRefResultJson(
@@ -27753,6 +27835,7 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              executionState: issues.executionState,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -27983,11 +28066,36 @@ export function heartbeatService(
           }))) return deferBlockedExecution(executionBlocker);
 
           const issueStateGuard = opts.issueStateGuard;
+          const guardedStage = issueStateGuard?.executionStageId
+            ? parseIssueExecutionState(issue.executionState)
+            : null;
+          // Re-check stage and first-run inside the same issue row lock, so a
+          // concurrent sweep or an already-finished run cannot double-deliver.
+          const [guardedPriorRun] = issueStateGuard?.requireNoAgentIssueRun
+            ? await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.agentId, agentId),
+                or(eq(heartbeatRuns.nativeIssueId, issue.id),
+                  sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+                issueStateGuard.agentIssueRunCreatedAtGte
+                  ? gte(heartbeatRuns.createdAt, new Date(issueStateGuard.agentIssueRunCreatedAtGte))
+                  : undefined,
+              )).limit(1)
+            : [];
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
-              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
+              (issueStateGuard.executionStageId &&
+                (guardedStage?.status !== (issueStateGuard.executionStateStatus ?? "pending") ||
+                  guardedStage.currentStageId !== issueStateGuard.executionStageId ||
+                  (guardedStage.status === "changes_requested"
+                    ? guardedStage.returnAssignee?.type !== "agent" ||
+                      guardedStage.returnAssignee.agentId !== agentId
+                    : guardedStage.currentParticipant?.type !== "agent" ||
+                      guardedStage.currentParticipant.agentId !== agentId))) ||
+              Boolean(guardedPriorRun))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
@@ -28000,7 +28108,7 @@ export function heartbeatService(
                 ...(payload ?? {}),
                 heartbeatSkip: {
                   reason:
-                    "Issue status or assignee changed before the wake could be queued.",
+                    "Issue state changed or the guarded participant already has a run.",
                   issueId: issue.id,
                   expectedStatuses: issueStateGuard.statuses,
                   actualStatus: issue.status,

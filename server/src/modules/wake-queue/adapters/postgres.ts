@@ -3,7 +3,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
 import {
@@ -40,7 +40,10 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
-import { hasInteractionContinuationWakeContext } from "../domain/context.js";
+import {
+  hasInteractionContinuationWakeContext,
+  classifyDeferredExecutionWake,
+} from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
@@ -182,7 +185,13 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow): WakeQueueTransaction {
+function buildTransaction(
+  tx: Db,
+  deps: WakeQueuePostgresAdapterDeps,
+  db: Db,
+  run: HeartbeatRunRow,
+  deferredExecutionWakeId?: string,
+): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
@@ -201,7 +210,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, excludedAgentId, preferredAgentId }) {
+    async findNextDeferredWake({
+      companyId,
+      issueId,
+      excludedWakeIds,
+      excludedAgentId,
+      preferredAgentId,
+      deferredExecutionWakeId,
+    }) {
       while (true) {
         const row = await tx
           .select()
@@ -210,6 +226,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              deferredExecutionWakeId ? eq(agentWakeupRequests.id, deferredExecutionWakeId) : undefined,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               excludedAgentId ? ne(agentWakeupRequests.agentId, excludedAgentId) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
@@ -1100,6 +1117,56 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        const [targetWake] = input.deferredExecutionWakeId
+          ? await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, input.deferredExecutionWakeId),
+              eq(agentWakeupRequests.companyId, input.companyId),
+              eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            )).limit(1)
+          : [];
+        const targetKind = targetWake && issueRow
+          ? classifyDeferredExecutionWake(targetWake, issueRow)
+          : null;
+        if (
+          input.deferredExecutionWakeId &&
+          (!targetKind ||
+            (targetKind === "continuation" &&
+              (run.status !== "succeeded" || run.agentId !== targetWake.agentId)))
+        )
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        const [covered] = targetWake && issueRow
+          ? await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.agentId, targetWake.agentId),
+              or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
+              gte(heartbeatRuns.createdAt, targetWake.requestedAt),
+            )).orderBy(asc(heartbeatRuns.createdAt)).limit(1)
+          : [];
+        if (covered) {
+          // A run from this wake's own agent already started at or after the
+          // request: the wake is covered, so settle it instead of re-promoting.
+          await tx.update(agentWakeupRequests).set({
+            status: "coalesced",
+            runId: covered.id,
+            finishedAt: input.now,
+            updatedAt: input.now,
+          }).where(and(
+            eq(agentWakeupRequests.id, targetWake.id),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ));
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
+        // A confirmed stage handoff (a stage wake behind a reassignment Stop)
+        // is not an operator cancellation: the stage participant must go
+        // through the normal proceed path instead of a plain release.
+        const confirmedStageHandoff =
+          targetKind === "stage" &&
+          run.status === "cancelled" &&
+          run.errorCode === "issue_reassigned" &&
+          run.resultJson?.reassignmentStopConfirmed === true &&
+          run.resultJson?.executionCancellation?.state === "acknowledged" &&
+          !(await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run));
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1112,11 +1179,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
-          executionCancellationAcknowledged:
-            isAcknowledgedNativeReassignmentStop(run) ||
+          executionCancellationAcknowledged: !confirmedStageHandoff &&
+            (isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue),
+            !interruptedQueue)),
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
@@ -1135,7 +1202,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // agent's review participation retains its separate recovery path.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.agentId, targetWake?.agentId ?? run.agentId),
           sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
@@ -1200,7 +1267,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly,
           otherAgentsOnly: preDrain.kind === "drain_other_agents" };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, input.deferredExecutionWakeId) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.

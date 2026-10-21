@@ -160,3 +160,102 @@ export function enrichPromotedWakeContext(
 
   return { contextSnapshot, taskKey };
 }
+
+/**
+ * A saved deferred business wake that carries no comment of its own is not a
+ * new permission. It may only resume native input that still belongs to the
+ * current execution stage and ownership. A mixed receipt carrying its own
+ * user message keeps flowing through the original comment queue; this
+ * classification never merges or overrides it.
+ */
+export function classifyDeferredExecutionWake(
+  wake: {
+    source: string;
+    reason: string | null;
+    agentId: string;
+    requestedByActorType: string | null;
+    payload: Record<string, unknown> | null;
+  },
+  issue: {
+    status: string;
+    assigneeAgentId: string | null;
+    conversationAgentId?: string | null;
+    executionState: import("@paperclipai/shared").IssueExecutionState | null;
+  },
+): "stage" | "continuation" | null {
+  const payload = wake.payload ?? {};
+  const seedRaw = payload._paperclipWakeContext;
+  const seed =
+    seedRaw && typeof seedRaw === "object" && !Array.isArray(seedRaw)
+      ? (seedRaw as Record<string, unknown>)
+      : {};
+  const reason = readNonEmptyString(seed.wakeReason) ?? wake.reason;
+  const queuedCommentIds = Array.isArray(payload.queuedCommentIds)
+    ? payload.queuedCommentIds
+    : [];
+  const seedWakeCommentIds = Array.isArray(seed.wakeCommentIds)
+    ? seed.wakeCommentIds
+    : [];
+  if (
+    payload.commentId ||
+    seed.commentId ||
+    seed.wakeCommentId ||
+    queuedCommentIds.length ||
+    seedWakeCommentIds.length
+  )
+    return null;
+  if (
+    issue.conversationAgentId ||
+    ["done", "cancelled", "blocked"].includes(issue.status) ||
+    issue.assigneeAgentId !== wake.agentId
+  )
+    return null;
+  if (
+    wake.source === "assignment" &&
+    [
+      "execution_review_requested",
+      "execution_approval_requested",
+      "execution_changes_requested",
+    ].includes(reason ?? "")
+  ) {
+    const stageRaw = payload.executionStage ?? seed.executionStage;
+    const stage =
+      stageRaw && typeof stageRaw === "object" && !Array.isArray(stageRaw)
+        ? (stageRaw as Record<string, unknown>)
+        : null;
+    const state = issue.executionState;
+    if (
+      !stage ||
+      !state ||
+      stage.stageId !== state.currentStageId ||
+      stage.stageType !== state.currentStageType
+    )
+      return null;
+    const returned = reason === "execution_changes_requested";
+    const target = returned ? state.returnAssignee : state.currentParticipant;
+    const targetAgentId =
+      target && target.type === "agent" ? target.agentId : null;
+    const expectedRole = returned
+      ? "executor"
+      : state.currentStageType === "approval"
+        ? "approver"
+        : "reviewer";
+    if (
+      state.status !== (returned ? "changes_requested" : "pending") ||
+      targetAgentId === null ||
+      targetAgentId !== wake.agentId ||
+      stage.wakeRole !== expectedRole
+    )
+      return null;
+    return "stage";
+  }
+  if (
+    wake.source === "automation" &&
+    wake.requestedByActorType === "system" &&
+    ["run_liveness_continuation", "issue_continuation_needed"].includes(
+      reason ?? "",
+    )
+  )
+    return "continuation";
+  return null;
+}

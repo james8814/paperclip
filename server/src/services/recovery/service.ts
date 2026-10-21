@@ -201,6 +201,11 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
+    executionStageId?: string;
+    executionStateStatus?: "pending" | "changes_requested";
+    requireNoAgentIssueRun?: boolean;
+    agentIssueRunCreatedAtGte?: Date | string;
   };
 };
 
@@ -627,6 +632,14 @@ export function classifyAdapterFailureForRecovery(
 ): AdapterFailureRecoveryClassification {
   // An engine prerequisite cannot be repaired by asking the same unavailable
   // engine to retry. Use the existing configuration-blocker path.
+  if (
+    latestRun.errorCode === "continuation_source_context_missing" ||
+    latestRun.errorCode === "continuation_user_authorization_missing"
+  ) {
+    // A missing continuation source binding cannot be repaired by retrying
+    // the same unavailable binding. Use the configuration-blocker path.
+    return { kind: "configuration_incomplete" };
+  }
   if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
     return { kind: "configuration_incomplete" };
   }
@@ -1886,6 +1899,77 @@ export function recoveryService(
     return Boolean(comment || attachment);
   }
 
+  // A first review assignment blocked by a gate has no reviewer run yet.
+  // Only a native skipped receipt from the same stage may be reused, and the
+  // original protection plus same-stage and status-version guards stay.
+  async function recoverUndispatchedReviewAssignment(
+    issue: typeof issues.$inferSelect,
+    participantAgentId: string,
+    state: NonNullable<ReturnType<typeof parseIssueExecutionState>>,
+  ) {
+    const [receipt] = await db
+      .select({
+        id: agentWakeupRequests.id,
+        requestedAt: agentWakeupRequests.requestedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, participantAgentId),
+          eq(agentWakeupRequests.source, "assignment"),
+          eq(agentWakeupRequests.status, "skipped"),
+          isNull(agentWakeupRequests.runId),
+          inArray(agentWakeupRequests.reason, [
+            "agent.not_invokable",
+            "budget.blocked",
+            "company.inactive",
+            "heartbeat.wakeOnDemand.disabled",
+            "execution_reconciliation_required",
+          ]),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+          sql`${agentWakeupRequests.payload}->'executionStage'->>'stageId' = ${state.currentStageId}`,
+          sql`${agentWakeupRequests.payload}->'executionStage'->>'stageType' = ${state.currentStageType}`,
+          state.status === "changes_requested"
+            ? and(
+                sql`${agentWakeupRequests.payload}->'executionStage'->'returnAssignee'->>'agentId' = ${participantAgentId}`,
+                sql`${agentWakeupRequests.payload}->'executionStage'->>'wakeRole' = 'executor'`,
+              )
+            : sql`${agentWakeupRequests.payload}->'executionStage'->'currentParticipant'->>'agentId' = ${participantAgentId}`,
+        ),
+      )
+      .orderBy(desc(agentWakeupRequests.requestedAt))
+      .limit(1);
+    if (
+      !receipt ||
+      (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) ||
+      (await isInvocationBudgetBlocked(issue, participantAgentId))
+    )
+      return null;
+    return enqueueStrandedIssueRecovery({
+      issueId: issue.id,
+      agentId: participantAgentId,
+      reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+      retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+      source: "issue.execution_review_recovery",
+      issueStateGuard: {
+        statuses: state.status === "changes_requested" ? ["in_progress"] : ["in_review"],
+        assigneeAgentId: participantAgentId,
+        statusVersion: issue.statusVersion,
+        executionStageId: state.currentStageId,
+        executionStateStatus: state.status,
+        requireNoAgentIssueRun: true,
+        agentIssueRunCreatedAtGte: receipt.requestedAt,
+      },
+      extraContext: {
+        currentStageId: state.currentStageId,
+        currentStageType: state.currentStageType,
+        reviewRecoveryInstruction:
+          "The current execution stage's assignment was blocked before its first run. Submit its review decision, or record the exact authorized wait or failure action.",
+      },
+    });
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -1907,6 +1991,15 @@ export function recoveryService(
      * run (native runtime, reconciliation) and the caller must leave it.
      */
     outcome?: { retryExhausted?: boolean };
+    issueStateGuard?: {
+      statuses: string[];
+      assigneeAgentId: string;
+      statusVersion?: number;
+      executionStageId?: string;
+      executionStateStatus?: "pending" | "changes_requested";
+      requireNoAgentIssueRun?: boolean;
+      agentIssueRunCreatedAtGte?: Date | string;
+    };
   }) {
     if (input.retryOfRunId) {
       const [predecessor] = await db
@@ -1991,6 +2084,7 @@ export function recoveryService(
             },
           }
         : {}),
+      ...(input.issueStateGuard ? { issueStateGuard: input.issueStateGuard } : {}),
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
@@ -4914,6 +5008,29 @@ export function recoveryService(
         }
       }
 
+      // The return author can also be blocked by an assignment gate; the
+      // author's previous run must not stand in for this continuation.
+      const returnedState =
+        issue.status === "in_progress"
+          ? parseIssueExecutionState(issue.executionState)
+          : null;
+      if (
+        returnedState?.status === "changes_requested" &&
+        returnedState.returnAssignee?.type === "agent" &&
+        returnedState.returnAssignee.agentId === agentId &&
+        agentInvokable
+      ) {
+        const returned = await recoverUndispatchedReviewAssignment(
+          issue,
+          agentId,
+          returnedState,
+        );
+        if (returned) {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+      }
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState) {
           result.skipped += 1;
@@ -4940,7 +5057,17 @@ export function recoveryService(
               result.skipped += 1;
             }
           } else {
-            result.skipped += 1;
+            const queuedUndispatched = await recoverUndispatchedReviewAssignment(
+              issue,
+              participantAgentId,
+              pendingExecutionState,
+            );
+            if (queuedUndispatched) {
+              result.reviewParticipantRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
           }
           continue;
         }

@@ -241,7 +241,13 @@ export interface WakeQueueTransaction {
  */
 export interface IssueLockWriter {
   withIssueExecutionLock(
-    input: { companyId: string; runId: string; now: Date },
+    input: {
+      companyId: string;
+      runId: string;
+      now: Date;
+      /** Release exactly this deferred wake instead of scanning the queue. */
+      deferredExecutionWakeId?: string;
+    },
     fn: (
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },

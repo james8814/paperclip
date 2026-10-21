@@ -8670,6 +8670,7 @@ export function issueService(db: Db) {
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
+          payload: agentWakeupRequests.payload,
         })
         .from(agentWakeupRequests)
         .where(

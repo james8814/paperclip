@@ -120,6 +120,8 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /** Release exactly this deferred wake instead of scanning the queue. */
+  deferredExecutionWakeId?: string;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -141,6 +143,9 @@ async function runReleaseDrain(
   const postCommitEffects: PostCommitEffect[] = [];
 
   if (locked.recoveryOnly) {
+    if (input.deferredExecutionWakeId) {
+      return { outcome: { kind: "released" }, postCommitEffects };
+    }
     return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
   }
 
@@ -313,6 +318,7 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  if (input.deferredExecutionWakeId) return { outcome: { kind: "released" }, postCommitEffects };
   if (locked.otherAgentsOnly) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
@@ -967,7 +973,12 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      {
+        companyId: input.companyId,
+        runId: input.runId,
+        now: input.now,
+        deferredExecutionWakeId: input.deferredExecutionWakeId,
+      },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

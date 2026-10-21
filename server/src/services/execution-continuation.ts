@@ -24,6 +24,57 @@ export class StaleExecutionContinuationError extends Error {
   }
 }
 
+/**
+ * A continuation whose saved source bindings are missing still fails closed.
+ * The error carries an auditable structured payload naming the exact missing
+ * binding instead of fabricating context or silently claiming completeness.
+ */
+export class ExecutionContinuationContextError extends Error {
+  readonly code:
+    | "continuation_source_context_missing"
+    | "continuation_user_authorization_missing";
+  readonly resultJson: {
+    continuationContextFailure: {
+      code: string;
+      kind:
+        | "source_run_binding_missing"
+        | "producer_run_binding_missing"
+        | "origin_comment_binding_missing";
+      issueId: string;
+      runId: string | null;
+      sourceRunId: string | null;
+      missingOriginCommentIds: string[];
+      nextAction: string;
+    };
+  };
+  constructor(
+    code: ExecutionContinuationContextError["code"],
+    kind:
+      | "source_run_binding_missing"
+      | "producer_run_binding_missing"
+      | "origin_comment_binding_missing",
+    input: { issueId: string; runId?: string },
+    sourceRunId: string | null,
+    missingOriginCommentIds: string[] = [],
+  ) {
+    super(code);
+    this.name = "ExecutionContinuationContextError";
+    this.code = code;
+    this.resultJson = {
+      continuationContextFailure: {
+        code,
+        kind,
+        issueId: input.issueId,
+        runId: input.runId ?? null,
+        sourceRunId,
+        missingOriginCommentIds,
+        nextAction:
+          "Inspect saved source bindings through native task/run metadata. Restore the exact original source through its authorized continuation path; do not substitute missing input or replay completed actions.",
+      },
+    };
+  }
+}
+
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
     ? (v as Record<string, unknown>)
@@ -213,10 +264,23 @@ export async function buildExecutionContinuation(input: {
   // belong to this task, and only task-scoped content can enter the envelope.
   const sourceRun = object(candidate?.context).issueId === issueId ? candidate : null;
   if ((sourceRunId && !candidate) || (resumeSourceRunId && !sourceRun))
-    throw new Error(explicitUserSource ? "continuation_user_authorization_missing" : "continuation_source_context_missing");
+    throw new ExecutionContinuationContextError(
+      explicitUserSource
+        ? "continuation_user_authorization_missing"
+        : "continuation_source_context_missing",
+      "source_run_binding_missing",
+      input,
+      sourceRunId ?? null,
+    );
   const producer = producerRunId === sourceRunId ? candidate
     : producerRunId ? await loadRun(producerRunId) : null;
-  if (producerRunId && !producer) throw new Error("continuation_source_context_missing");
+  if (producerRunId && !producer)
+    throw new ExecutionContinuationContextError(
+      "continuation_source_context_missing",
+      "producer_run_binding_missing",
+      input,
+      sourceRunId ?? null,
+    );
   const producerIssueId = string(object(producer?.context).issueId);
   const producerOrigins = new Set(continuationOriginCommentIds(producer?.context));
   const recordedOrigins = triggerInteraction?.originCommentIds ?? [];
@@ -244,8 +308,17 @@ export async function buildExecutionContinuation(input: {
     ]),
   ];
   // Missing source rows cannot silently become a claim of complete context.
-  if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
-    throw new Error("continuation_source_context_missing");
+  const missingOriginCommentIds = originCommentIds.filter(
+    (id) => !rows.some((row) => row.id === id),
+  );
+  if (missingOriginCommentIds.length)
+    throw new ExecutionContinuationContextError(
+      "continuation_source_context_missing",
+      "origin_comment_binding_missing",
+      input,
+      sourceRunId ?? null,
+      missingOriginCommentIds,
+    );
   const messages = rows.map((row) => {
     const safe = input.exposeLowTrustRaw
       ? row
@@ -414,7 +487,12 @@ export async function buildExecutionContinuation(input: {
                 : comment.authorUserId === value.actorId) &&
               !comment.createdByRunId && !comment.deletedAt));
     if (!predecessor || !authorization || explicitUserSource !== sourceRunId)
-      throw new Error("continuation_user_authorization_missing");
+      throw new ExecutionContinuationContextError(
+        "continuation_user_authorization_missing",
+        "source_run_binding_missing",
+        input,
+        sourceRunId ?? null,
+      );
   }
   const interruptedRunId = explicitUserSource ?? string(input.context.interruptedRunId) ?? (lastTerminal && lastTerminal.status !== "succeeded" &&
     (hasConversationContinuationPolicy(lastTerminal.result) ||
