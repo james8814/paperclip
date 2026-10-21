@@ -1081,6 +1081,19 @@ export function agentService(db: Db) {
         await issueThreadInteractionService(tx as unknown as Db)
           .cancelPendingForDeletedAddressee(existing.companyId, id);
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
+        // Ported from upstream PR #16706 ("fix(server): detach open conversations before
+        // deleting an agent", fixes #16703). Clear the conversation identity along with the
+        // assignee so the conversation-identity check stays valid; the issue remains as a
+        // normal task. Drop this once a release carries the upstream change.
+        await tx
+          .update(issues)
+          .set({
+            assigneeAgentId: null,
+            conversationAgentId: null,
+            conversationUserId: null,
+            conversationState: null,
+          })
+          .where(eq(issues.conversationAgentId, id));
         await tx
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
