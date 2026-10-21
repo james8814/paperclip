@@ -4,7 +4,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, not, or, sql, type SQL } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -22,6 +22,15 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+
+// Mirrors upstream PR #16291 (services/execution-identity.ts): coerce run
+// evidence text to a canonical uuid before comparing it with uuid columns, so
+// malformed values become null instead of raising a cast error. Keep until a
+// release ships the upstream helper.
+function canonicalExecutionUuid(text: SQL): SQL<string | null> {
+  return sql<string | null>`case when ${text} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    then (${text})::uuid end`;
+}
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -360,8 +369,14 @@ export async function settleUnrecoverableExecutions(
       heartbeatRuns,
       and(
         eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
-        sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
-        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
+        eq(heartbeatRuns.id, canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)),
+        or(
+          eq(heartbeatRuns.nativeIssueId, issueRecoveryActions.sourceIssueId),
+          and(
+            isNull(heartbeatRuns.nativeIssueId),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text`,
+          ),
+        ),
       ),
     )
     .leftJoin(

@@ -1,6 +1,15 @@
-import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { readProcessStartedAt } from "./hot-restart.js";
+
+// Mirrors upstream PR #16291 (services/execution-identity.ts): coerce run
+// evidence text to a canonical uuid before comparing it with uuid columns, so
+// malformed values become null instead of raising a cast error. Keep until a
+// release ships the upstream helper.
+function canonicalExecutionUuid(text: SQL): SQL<string | null> {
+  return sql<string | null>`case when ${text} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    then (${text})::uuid end`;
+}
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -68,8 +77,14 @@ export function conversationRecoveryActionPredicate() {
     sql`exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
-        and ${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'
-        and coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text
+        and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)}
+        and ${or(
+          eq(heartbeatRuns.nativeIssueId, issueRecoveryActions.sourceIssueId),
+          and(
+            isNull(heartbeatRuns.nativeIssueId),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text`,
+          ),
+        )}
         and ${heartbeatRuns.runtimeMode} = 'legacy'
         and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
         and ${inArray(heartbeatRuns.status, ['failed', 'timed_out', 'interrupted', 'cancelled'])}
@@ -108,7 +123,10 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
     .where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
       conversationRunPredicate(),
-      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+      or(
+        eq(heartbeatRuns.nativeIssueId, canonicalExecutionUuid(sql`${issueId}::text`)),
+        and(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+      ),
       inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));

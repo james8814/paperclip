@@ -1,7 +1,16 @@
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql, type SQL } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { publishLiveEvent } from "./live-events.js";
 import { logger } from "../middleware/logger.js";
+
+// Mirrors upstream PR #16291 (services/execution-identity.ts): coerce run
+// evidence text to a canonical uuid before comparing it with uuid columns, so
+// malformed values become null instead of raising a cast error. Keep until a
+// release ships the upstream helper.
+function canonicalExecutionUuid(text: SQL): SQL<string | null> {
+  return sql<string | null>`case when ${text} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    then (${text})::uuid end`;
+}
 
 /** Status delivery is at-least-once; clients invalidate by run id. It grants no execution authority. */
 export async function deliverExecutionStatuses(
@@ -24,17 +33,19 @@ export async function deliverExecutionStatuses(
     })
     .from(heartbeatRuns)
     // Match terminalization's native-first association, but expose only an
-    // existing same-company canonical task ID. Compare text so malformed
-    // context values cannot cause a UUID cast error or escape onto the wire.
+    // existing same-company canonical task ID. Malformed context values cast
+    // to null instead of raising a UUID error.
     .leftJoin(
       issues,
       and(
         eq(issues.companyId, heartbeatRuns.companyId),
-        sql`${issues.id}::text = coalesce(
-        ${heartbeatRuns.nativeIssueId}::text,
-        case when jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'issueId') = 'string'
-          then ${heartbeatRuns.contextSnapshot} ->> 'issueId' end
-      )`,
+        eq(
+          issues.id,
+          sql`coalesce(
+          ${heartbeatRuns.nativeIssueId},
+          ${canonicalExecutionUuid(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`)}
+        )`,
+        ),
       ),
     )
     .where(isNotNull(heartbeatRuns.executionStatusDeliveryId))
