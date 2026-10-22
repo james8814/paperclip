@@ -6,6 +6,7 @@
 
 import { extractWakeCommentIds, WAKE_COMMENT_IDS_KEY } from "../../run-dispatch/index.js";
 import { readNonEmptyString } from "./values.js";
+import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_WAKE_COMMENT_KEY = "paperclipWakeComment";
@@ -223,7 +224,7 @@ export function classifyDeferredExecutionWake(
       stageRaw && typeof stageRaw === "object" && !Array.isArray(stageRaw)
         ? (stageRaw as Record<string, unknown>)
         : null;
-    const state = issue.executionState;
+    const state = parseIssueExecutionState(issue.executionState);
     if (
       !stage ||
       !state ||

@@ -9356,6 +9356,7 @@ export function issueRoutes(
                 issue: lockedIssue,
                 recoveryAction: settled,
                 replayed: true,
+                verificationOnly: undefined,
               };
             }
           }
@@ -9678,7 +9679,7 @@ export function issueRoutes(
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
 
-        return { issue, recoveryAction, chatRetry };
+        return { issue, recoveryAction, chatRetry, verificationOnly: undefined };
       });
       if (result.verificationOnly) {
         res.json({

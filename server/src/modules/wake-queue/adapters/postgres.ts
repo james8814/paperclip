@@ -634,7 +634,7 @@ function buildTransaction(
         )
         .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
         .limit(1);
-      if (!previous || !Object.keys(details).every((key) => (previous.details as Record<string, unknown>)?.[key] === details[key]))
+      if (!previous || !Object.keys(details).every((key) => (previous.details as Record<string, unknown>)?.[key] === (details as Record<string, unknown>)[key]))
         await tx.insert(activityLog).values({
           companyId,
           actorType: "system",

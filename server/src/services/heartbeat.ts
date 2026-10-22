@@ -1426,15 +1426,16 @@ export function getTaskDrainStatus(): {
 
 // Counts only describe queue delivery; they are never a substitute for real
 // product acceptance. Unknown or failed rows keep the stop pending.
-function projectTaskDrainQueueStatus(startedAt: string, rows: Array<{ status: string; runStatus: string | null; count: number }>) {
+function projectTaskDrainQueueStatus(startedAt: string, rows: Array<{ status: string | null; runStatus: string | null; count: number }>) {
   let total = 0, pending = 0, resumed = 0, lost = 0, unknown = 0;
   for (const row of rows) {
+    const status = row.status ?? "";
     const count = Number(row.count);
     if (!Number.isSafeInteger(count) || count < 0)
       return { startedAt, complete: false, retained: false, resumed: false };
     total += count;
-    if (["skipped", "failed", "cancelled"].includes(row.status)) lost += count;
-    else if (["claimed", "completed", "coalesced", "queued"].includes(row.status) &&
+    if (["skipped", "failed", "cancelled"].includes(status)) lost += count;
+    else if (["claimed", "completed", "coalesced", "queued"].includes(status) &&
       ["running", "succeeded"].includes(row.runStatus)) resumed += count;
     else if (row.status === "queued" && row.runStatus === "queued" ||
       row.status === "deferred_issue_execution" && row.runStatus === null) pending += count;

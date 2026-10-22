@@ -658,6 +658,7 @@ export type {
   IssueWakeDiagnosticActivityRecord,
   IssueWakeDiagnosticEvent,
   IssueWakeDiagnosticWakeFailureClass,
+  IssueWakeDiagnosticWakeGate,
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,

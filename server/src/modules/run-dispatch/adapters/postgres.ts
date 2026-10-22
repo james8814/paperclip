@@ -167,7 +167,7 @@ export async function readPendingInteractionAddressee(dbOrTx: Db, input: {
         typeof interaction.payload === "object" &&
         interaction.payload !== null &&
         "toolAction" in interaction.payload &&
-        (interaction.payload as Record<string, unknown>).toolAction !== undefined,
+        (interaction.payload as unknown as Record<string, unknown>).toolAction !== undefined,
     }));
   return { interactionId, status, addresseeActive };
 }

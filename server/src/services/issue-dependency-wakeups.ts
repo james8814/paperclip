@@ -179,7 +179,7 @@ function wakeCoversIssueBlockersResolvedReadyState(
   },
   keys: {
     cycleKey: string;
-    oldStateKey: string;
+    oldStateKey: string | null;
     legacyKeys: Set<string>;
     blockedTransitionAt: Date | null;
   },
