@@ -140,6 +140,37 @@ importers:
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
+      postgres:
+        specifier: 3.4.9
+        version: 3.4.9(patch_hash=sryle6qd5qfmnxvoebal4gashi)
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+    optionalDependencies:
+      '@embedded-postgres/darwin-arm64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/darwin-x64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/linux-arm':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/linux-arm64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/linux-ia32':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/linux-ppc64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/linux-x64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
+      '@embedded-postgres/windows-x64':
+        specifier: 18.1.0-beta.16
+        version: 18.1.0-beta.16
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
