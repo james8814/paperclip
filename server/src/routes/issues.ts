@@ -327,7 +327,7 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
-import { deliverAgentUnblockNotification, isOwnerCurrentIssueRun } from "../services/routable-blocked.js";
+import { blockedContentFingerprint, deliverAgentUnblockNotification, isOwnerCurrentIssueRun } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -13964,7 +13964,8 @@ export function issueRoutes(
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
 
-      if (enteringBlocked) {
+      if (enteringBlocked || (issue.status === "blocked" &&
+        blockedContentFingerprint(existing) !== blockedContentFingerprint(issue))) {
         const blockedIssue = issue;
         let ownerNotifiedAt: Date | null = null;
         await deliverAgentUnblockNotification({
@@ -14003,6 +14004,9 @@ export function issueRoutes(
               and(
                 eq(issueRows.id, blockedIssue.id),
                 eq(issueRows.companyId, blockedIssue.companyId),
+                eq(issueRows.status, "blocked"),
+                eq(issueRows.blockedTransitionAt, blockedIssue.blockedTransitionAt),
+                sql`${issueRows.blockedNotificationState} = ${JSON.stringify(blockedIssue.blockedNotificationState)}::jsonb`,
               ),
             );
           issue = { ...blockedIssue, blockedOwnerNotifiedAt: ownerNotifiedAt };

@@ -447,6 +447,7 @@ import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, findCoveringIssueBlockersResolvedWakeForStateKey } from "./issue-dependency-wakeups.js";
+import { planAgentUnblockNotification } from "./routable-blocked.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -27846,6 +27847,11 @@ export function heartbeatService(
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              title: issues.title,
+              description: issues.description,
+              unblockDescriptor: issues.unblockDescriptor,
+              blockedTransitionAt: issues.blockedTransitionAt,
+              blockedNotificationState: issues.blockedNotificationState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -27922,6 +27928,31 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          // Content-version notification dedup inside the native row lock.
+          if (source === "automation" && triggerDetail === "system" &&
+            reason === "issue_unblock_requested" &&
+            opts.idempotencyKey?.startsWith("issue-unblock-content:")) {
+            const notification = planAgentUnblockNotification(issue, agentId, payload);
+            if (notification.kind !== "enqueue" || opts.idempotencyKey !== notification.idempotencyKey)
+              return { kind: "deferred" as const };
+            const [priorNotification] = await tx.select().from(agentWakeupRequests)
+              .where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.source, source),
+                eq(agentWakeupRequests.triggerDetail, triggerDetail),
+                eq(agentWakeupRequests.reason, reason),
+                eq(agentWakeupRequests.idempotencyKey, notification.idempotencyKey),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                ne(agentWakeupRequests.status, "skipped"),
+                executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined))
+              .limit(1);
+            // An existing receipt is owned by the native queue and recovery;
+            // a duplicate notification must not dispatch again or replay any
+            // external action.
+            if (priorNotification)
+              return { kind: "deferred" as const };
+            payload = notification.payload;
+          }
           if (opts.failedRunId) {
             // The issue lock makes double-clicks and network retries adopt the
             // same successor, including after it has already finished.

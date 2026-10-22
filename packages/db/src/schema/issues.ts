@@ -84,6 +84,7 @@ export const issues = pgTable(
     unblockDescriptor: jsonb("unblock_descriptor").$type<IssueUnblockDescriptor | null>(),
     blockedTransitionAt: timestamp("blocked_transition_at", { withTimezone: true }),
     blockedOwnerNotifiedAt: timestamp("blocked_owner_notified_at", { withTimezone: true }),
+    blockedNotificationState: jsonb("blocked_notification_state").$type<{ fingerprint: string; generation: number } | null>(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),

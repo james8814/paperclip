@@ -1,4 +1,5 @@
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
+import { advanceBlockedNotificationState } from "./routable-blocked.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
@@ -11031,6 +11032,9 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        // Maintain the blocked-notification content version inside the same
+        // native row lock as receiptExisting.
+        patch.blockedNotificationState = advanceBlockedNotificationState(receiptExisting, patch);
         const updated = await tx
           .update(issues)
           .set(patch)
