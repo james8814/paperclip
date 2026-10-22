@@ -446,7 +446,7 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, findCoveringIssueBlockersResolvedWakeForStateKey } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -27875,6 +27875,44 @@ export function heartbeatService(
               triggerDetail,
               reason: "issue_execution_issue_not_found",
               payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
+          // The route, finalize, and backstop emit paths check-then-enqueue
+          // outside the lock; the same dependency-resolution input is
+          // re-checked here under this row lock, and an in-flight or already
+          // consumed wake for the same key suppresses the duplicate so only
+          // one emission wins across processes.
+          const coveringDependencyWake = reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
+            ? await findCoveringIssueBlockersResolvedWakeForStateKey(tx, {
+              companyId: agent.companyId,
+              idempotencyKey: opts.idempotencyKey,
+              excludeWakeupRequestId: executionWaitRequestId ?? null,
+            })
+            : null;
+          if (coveringDependencyWake) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_blockers_resolved_duplicate",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  reason: "dependency_ready_state_already_covered",
+                  issueId: issue.id,
+                  coveringWakeupRequestId: coveringDependencyWake.id,
+                  coveringStatus: coveringDependencyWake.status,
+                },
+              },
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,

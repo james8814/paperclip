@@ -1,9 +1,43 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
+
+/**
+ * Whether moving an issue into `blocked` should immediately wake its assignee
+ * because every recorded blocker is already resolved ("blockers restored").
+ *
+ * The assignee agent blocking its own issue is declaring a wait on something
+ * outside the blocker graph (a pending confirmation, a human action). Waking it
+ * straight back made it re-block in a loop: every re-block stamps a new
+ * `blockedTransitionAt`, so the ready-state dedup key never matched and the
+ * agent was woken again on each run (five wakes in four minutes observed).
+ * Board or other-actor transitions and assignee changes still wake, and the
+ * dependency backstop still covers a genuinely stranded issue.
+ */
+// Backported verbatim from upstream PR 14180 (8d9d2f9d) with the TS types removed.
+export function shouldWakeOnRestoredBlockedDependency(input: {
+  previousStatus: string;
+  nextStatus: string;
+  previousAssigneeAgentId: string | null;
+  nextAssigneeAgentId: string | null;
+  blockerSetEdited: boolean;
+  actorType: string;
+  actorAgentId: string | null;
+}): boolean {
+  if (input.nextStatus !== "blocked" || !input.nextAssigneeAgentId)
+    return false;
+  const assigneeChanged = input.previousAssigneeAgentId !== input.nextAssigneeAgentId;
+  if (input.previousStatus === "blocked" && !input.blockerSetEdited && !assigneeChanged)
+    return false;
+  const selfBlockedByAssignee = input.actorType === "agent" &&
+    input.actorAgentId !== null &&
+    input.actorAgentId === input.nextAssigneeAgentId &&
+    !assigneeChanged;
+  return !selfBlockedByAssignee;
+}
 
 // A wake counts as "already delivered or in flight for the current ready state"
 // for these statuses. The level-triggered state key uses this full set so that
@@ -233,6 +267,55 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),
       blockedTransitionAt,
+    }),
+  );
+  return covering ?? null;
+}
+
+/**
+ * Called while the enqueuer holds the woken issue's row lock. The route,
+ * finalize, and backstop emit paths check-then-enqueue outside the lock, so
+ * concurrent emitters can all miss; under the lock, re-check the same state
+ * key with the same covering rule so exactly one emission wins across
+ * processes. excludeWakeupRequestId skips the row being promoted itself.
+ */
+export async function findCoveringIssueBlockersResolvedWakeForStateKey(
+  db: Db,
+  input: {
+    companyId: string;
+    idempotencyKey: string | null | undefined;
+    excludeWakeupRequestId?: string | null;
+  },
+): Promise<{
+  id: string;
+  status: string;
+  idempotencyKey: string | null;
+  requestedAt: Date;
+} | null> {
+  if (typeof input.idempotencyKey !== "string" ||
+    !input.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:state:`))
+    return null;
+  const rows = await db
+    .select({
+      id: agentWakeupRequests.id,
+      status: agentWakeupRequests.status,
+      idempotencyKey: agentWakeupRequests.idempotencyKey,
+      requestedAt: agentWakeupRequests.requestedAt,
+    })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        input.excludeWakeupRequestId ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId) : undefined,
+      ),
+    );
+  const covering = rows.find((row) =>
+    wakeCoversIssueBlockersResolvedReadyState(row, {
+      cycleKey: input.idempotencyKey,
+      oldStateKey: null,
+      legacyKeys: new Set(),
+      blockedTransitionAt: null,
     }),
   );
   return covering ?? null;

@@ -31,6 +31,12 @@ export async function deliverAgentUnblockNotification(input: {
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
+  /** Present when the caller can identify the writer's own run; when it
+   * returns true the current legitimate live run of this issue made itself
+   * the unblock owner and is already waiting on the outcome, so no successor
+   * run is queued for it. Writers other than the owner agent, owner runs on
+   * other issues, and writes without a run keep the notification. */
+  isOwnerCurrentIssueRun?: (ownerAgentId: string) => Promise<boolean>;
   now?: () => Date;
 }) {
   const { issue } = input;
@@ -40,6 +46,13 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
+
+  // This issue's current legitimate live run set itself as the unblock owner
+  // and reported blocked; the wait is already owned by that run, so do not
+  // queue a successor for it. Consulted only for this writer: anyone else,
+  // or the same owner from a run on another issue, still gets notified.
+  if (input.isOwnerCurrentIssueRun && (await input.isOwnerCurrentIssueRun(owner.agentId)))
+    return false;
 
   await input.wakeup(owner.agentId, {
     source: "automation",
@@ -51,4 +64,33 @@ export async function deliverAgentUnblockNotification(input: {
   });
   await input.markNotified((input.now ?? (() => new Date()))());
   return true;
+}
+
+// The writer's run must be the owner agent's own, currently running, and
+// bound to this issue; an unreadable run or any mismatch counts as "not the
+// owner's run" and keeps the notification.
+export function isOwnerCurrentIssueRun(
+  run: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    status: string;
+    nativeIssueId?: string | null;
+    contextSnapshot?: Record<string, unknown> | null;
+  } | null | undefined,
+  input: {
+    issue: {
+      id: string;
+      companyId: string;
+      executionRunId?: string | null;
+    };
+    ownerAgentId: string;
+  },
+): boolean {
+  if (!run || run.companyId !== input.issue.companyId || run.agentId !== input.ownerAgentId || run.status !== "running")
+    return false;
+  const context = run.contextSnapshot && typeof run.contextSnapshot === "object" ? run.contextSnapshot : {};
+  return run.nativeIssueId === input.issue.id ||
+    (context.issueId ?? context.taskId) === input.issue.id ||
+    input.issue.executionRunId === run.id;
 }

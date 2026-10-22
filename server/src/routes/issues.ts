@@ -271,6 +271,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  shouldWakeOnRestoredBlockedDependency,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -326,7 +327,7 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
-import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
+import { deliverAgentUnblockNotification, isOwnerCurrentIssueRun } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -13972,6 +13973,27 @@ export function issueRoutes(
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
+          // Only the owner agent writing through its own run counts; board
+          // and user writes, and runs bound to other issues, always keep the
+          // notification.
+          isOwnerCurrentIssueRun: async (ownerAgentId) => {
+            const writer = getActorInfo(req);
+            if (writer.actorType !== "agent" || writer.agentId !== ownerAgentId || !writer.runId) {
+              return false;
+            }
+            try {
+              return isOwnerCurrentIssueRun(await heartbeat.getRun(writer.runId), {
+                issue: blockedIssue,
+                ownerAgentId,
+              });
+            } catch (err) {
+              logger.warn(
+                { err, issueId: blockedIssue.id, runId: writer.runId },
+                "failed to read writer run before unblock notification",
+              );
+              return false;
+            }
+          },
         });
         if (ownerNotifiedAt) {
           await db
@@ -14941,12 +14963,15 @@ export function issueRoutes(
           }
         }
 
-        const restoredBlockedReadyDependency =
-          issue.status === "blocked" &&
-          issue.assigneeAgentId &&
-          (existing.status !== "blocked" ||
-            Array.isArray(req.body.blockedByIssueIds) ||
-            existing.assigneeAgentId !== issue.assigneeAgentId);
+        const restoredBlockedReadyDependency = shouldWakeOnRestoredBlockedDependency({
+          previousStatus: existing.status,
+          nextStatus: issue.status,
+          previousAssigneeAgentId: existing.assigneeAgentId ?? null,
+          nextAssigneeAgentId: issue.assigneeAgentId ?? null,
+          blockerSetEdited: Array.isArray(req.body.blockedByIssueIds),
+          actorType: getActorInfo(req).actorType,
+          actorAgentId: getActorInfo(req).agentId ?? null,
+        });
         if (
           restoredBlockedReadyDependency &&
           typeof dependencyReadinessSvc.getDependencyReadiness === "function"

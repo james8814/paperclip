@@ -64,6 +64,7 @@ import {
   statusDecisions,
   routines,
   workAssessments,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -1204,6 +1205,53 @@ export function recoveryService(
     ]);
 
     return Boolean(run || deferredWake || nativeRecovery);
+  }
+
+  // Backported from upstream PR 14180 (8d9d2f9d). This tree's heartbeat_runs
+  // has no issue_id column, so run attribution uses the native_issue_id /
+  // contextSnapshot.issueId pair already present here; the remaining
+  // conditions follow the upstream query.
+  async function wasBlockedByAssigneeAgent(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    blockedTransitionAt: Date | null,
+    blockerIssueIds: string[],
+  ): Promise<boolean> {
+    if (!blockedTransitionAt)
+      return false;
+    const row = await db
+      .select({
+        actorType: activityLog.actorType,
+        actorId: activityLog.actorId,
+        agentId: activityLog.agentId,
+        runAgentId: heartbeatRuns.agentId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, activityLog.runId), eq(heartbeatRuns.companyId, companyId), or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`)))
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated"), gte(activityLog.createdAt, new Date(blockedTransitionAt.getTime() - 5_000)), sql`(
+            ${activityLog.details} ?| array['status', 'toStatus', 'assigneeAgentId', 'assigneeUserId', 'blockedByIssueIds']
+            or (${activityLog.details}->'changes') ?| array['status', 'assigneeAgentId', 'assigneeUserId', 'blockedByIssueIds']
+          )`))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const details = row?.details ?? {};
+    const selfBlocked = row?.actorType === "agent" && row.agentId === agentId && details.status === "blocked";
+    const nativeSelfBlocked = row?.actorType === "system" &&
+      row.actorId === "native-status-committer" && row.runAgentId === agentId &&
+      details.source === "native_status_decision" && details.toStatus === "blocked";
+    if (!selfBlocked && !nativeSelfBlocked)
+      return false;
+    const newlyCompletedBlocker = await db.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds), gt(issues.completedAt, blockedTransitionAt))).limit(1);
+    if (newlyCompletedBlocker.length > 0)
+      return false;
+    const newlyFinalizedBlocker = await db.select({ id: workspaceOperations.id }).from(workspaceOperations)
+      .innerJoin(issues, and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds), eq(issues.executionWorkspaceId, workspaceOperations.executionWorkspaceId), eq(workspaceOperations.issueId, issues.id)))
+      .where(and(eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.phase, "workspace_finalize"), eq(workspaceOperations.status, "succeeded"), gt(workspaceOperations.finishedAt, blockedTransitionAt)))
+      .limit(1);
+    return newlyFinalizedBlocker.length === 0;
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
@@ -6028,6 +6076,7 @@ export function recoveryService(
       checked: 0,
       healed: 0,
       existingWakeSkipped: 0,
+      selfBlockedSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -6192,6 +6241,16 @@ export function recoveryService(
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          continue;
+        }
+
+        // The assignee agent opened this blocked cycle itself, knowing its
+        // recorded blockers were resolved: it is waiting on something outside
+        // the blocker graph. Re-waking it here made it re-block on every
+        // sweep (each re-block stamps a new cycle, so the ready-state key
+        // never repeats).
+        if (await wasBlockedByAssigneeAgent(companyId, candidate.id, agentId, candidate.blockedTransitionAt, readiness.blockerIssueIds)) {
+          result.selfBlockedSkipped += 1;
           continue;
         }
 
