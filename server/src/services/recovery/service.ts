@@ -1,4 +1,5 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -480,6 +481,64 @@ function didAutomaticRecoveryFail(
     )
   );
 }
+
+// A participant recovery round only counts toward this round's recovery
+// budget when it belongs to the current stage and status version. Rounds
+// from before the last version bump carry no version marker: a cancellation
+// for reassignment proves a later reassignment happened (the status version
+// must have advanced), so that round is stale; anything undecidable stays
+// with the native classification.
+function staleReviewRoundReason(
+  run: LatestIssueRun,
+  issue: typeof issues.$inferSelect,
+  state: NonNullable<ReturnType<typeof parseIssueExecutionState>>,
+  sameRoundRecoveryComment = false,
+): "stale_stage" | "stale_status_version" | "cancelled_by_reassignment" | null {
+  const context = parseObject(run?.contextSnapshot);
+  const stageId = readNonEmptyString(context.currentStageId) ??
+    readNonEmptyString(parseObject(context.executionStage).stageId);
+  if (stageId && stageId !== state.currentStageId)
+    return "stale_stage";
+  if (context.currentStatusVersion !== undefined && context.currentStatusVersion !== null) {
+    // A periodic reconciliation read may receive a pre-review snapshot of the
+    // issue; a version the run already persisted must not be misjudged as
+    // stale by that older snapshot. Only a run version behind the current
+    // issue version is a stale round.
+    //
+    // A recovery participant may write its required comment before the
+    // adapter fails. That comment advances issue.statusVersion without
+    // changing the pending stage or participant; keep this same run in the
+    // current round instead of routing it through the unavailable-assignee
+    // escalation gate.
+    const currentRoundShape = issue.status === "in_review" &&
+      state.status === "pending" && state.currentParticipant?.type === "agent" &&
+      state.currentParticipant.agentId === run?.agentId;
+    // The comment and the run-failure commit can race: the comment is
+    // durable by the time the issue is read back, but the reconciliation
+    // query may not see it yet. A single version advance with the same
+    // stage and participant is the same current round in that window.
+    const oneVersionAdvance = Number(issue.statusVersion) === Number(context.currentStatusVersion) + 1;
+    const sameStageVersionAdvance = issue.status === "in_review" &&
+      state.currentStageId === stageId && oneVersionAdvance;
+    const sameRoundEvidence = (sameRoundRecoveryComment && currentRoundShape) ||
+      (oneVersionAdvance && (currentRoundShape || sameStageVersionAdvance));
+    return Number(context.currentStatusVersion) < Number(issue.statusVersion) &&
+      !sameRoundEvidence
+      ? "stale_status_version"
+      : null;
+  }
+  return run?.errorCode === "issue_reassigned" ? "cancelled_by_reassignment" : null;
+}
+
+// Single source of truth: the service process environment. Unset or invalid
+// values mean 1, matching the native "one failed recovery attempt this round
+// escalates" behavior.
+function readReviewRecoveryMaxAttempts() {
+  const configured = Number(process.env.PAPERCLIP_REVIEW_RECOVERY_MAX_ATTEMPTS ?? 1);
+  return Number.isFinite(configured) && configured >= 1 ? Math.trunc(configured) : 1;
+}
+
+const REVIEW_ROUND_ASSESSED_ACTION = "issue.review_round_assessed";
 
 function isTerminalIssueRun(latestRun: LatestIssueRun) {
   if (!latestRun) return false;
@@ -1964,10 +2023,131 @@ export function recoveryService(
       extraContext: {
         currentStageId: state.currentStageId,
         currentStageType: state.currentStageType,
+        currentStatusVersion: issue.statusVersion,
         reviewRecoveryInstruction:
           "The current execution stage's assignment was blocked before its first run. Submit its review decision, or record the exact authorized wait or failure action.",
       },
     });
+  }
+
+  async function hasPendingIssueApproval(issue: typeof issues.$inferSelect) {
+    const [pendingApproval] = await db
+      .select({ id: approvals.id })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+      .where(
+        and(
+          eq(issueApprovals.companyId, issue.companyId),
+          eq(issueApprovals.issueId, issue.id),
+          eq(approvals.companyId, issue.companyId),
+          eq(approvals.status, "pending"),
+        ),
+      )
+      .limit(1);
+    return Boolean(pendingApproval);
+  }
+
+  // A participant's own recovery comment can advance statusVersion before its
+  // adapter failure is persisted. Treat that comment as same-round evidence.
+  async function hasCurrentReviewRecoveryComment(issue: typeof issues.$inferSelect, run: LatestIssueRun) {
+    if (!run?.id)
+      return false;
+    const [comment] = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, issue.companyId),
+          eq(issueComments.issueId, issue.id),
+          eq(issueComments.createdByRunId, run.id),
+        ),
+      )
+      .limit(1);
+    return Boolean(comment);
+  }
+
+  // Failed recovery attempts of the current round (same stage id and status
+  // version), counted up to the attempt budget limit.
+  async function countCurrentRoundFailedReviewRecoveries(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+    state: NonNullable<ReturnType<typeof parseIssueExecutionState>>,
+    limit: number,
+    statusVersion: number = issue.statusVersion,
+  ) {
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, [...UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES] as string[]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'currentStageId' = ${state.currentStageId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'currentStatusVersion' = ${String(statusVersion)}`,
+        ),
+      )
+      .limit(limit);
+    return rows.length;
+  }
+
+  // Requeue the review participant once for the current round. Requires the
+  // same stage, the same status version, the same participant, and no newer
+  // participant run after `afterRun`; the attribution matches the first
+  // participant's. Returns { run, outcome } where outcome only feeds decision
+  // logging.
+  async function requeueCurrentReviewRound(
+    issue: typeof issues.$inferSelect,
+    participantAgentId: string,
+    state: NonNullable<ReturnType<typeof parseIssueExecutionState>>,
+    afterRun: LatestIssueRun,
+    attribution: string,
+  ): Promise<{ run: LatestIssueRun | null; outcome: string }> {
+    const declined = (outcome: string) => ({ run: null as LatestIssueRun | null, outcome });
+    if (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId))
+      return declined("queued_wake");
+    const recoveryContext = parseObject(afterRun?.contextSnapshot);
+    const allowCurrentRoundBudget = recoveryContext.currentStageId === state.currentStageId &&
+      Number.isInteger(Number(recoveryContext.currentStatusVersion)) &&
+      readNonEmptyString(recoveryContext.retryReason) === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON &&
+      UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(afterRun?.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number]);
+    if ((await isInvocationBudgetBlocked(issue, participantAgentId)) && !allowCurrentRoundBudget)
+      return declined("budget_blocked");
+    if (await getExecutionBlocker(db, issue.companyId, issue.id))
+      return declined("execution_blocker");
+    if (await hasPersistedDurableWaitPath(issue, null))
+      return declined("durable_wait");
+    if (await hasPendingWakeInteraction(issue.companyId, issue.id))
+      return declined("pending_interaction");
+    if (await hasPendingIssueApproval(issue))
+      return declined("pending_approval");
+    const run = await enqueueStrandedIssueRecovery({
+      issueId: issue.id,
+      agentId: participantAgentId,
+      reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+      retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+      source: "issue.execution_review_recovery",
+      issueStateGuard: {
+        statuses: ["in_review"],
+        assigneeAgentId: participantAgentId,
+        statusVersion: issue.statusVersion,
+        executionStageId: state.currentStageId,
+        executionStateStatus: "pending",
+        requireNoAgentIssueRun: true,
+        agentIssueRunCreatedAtGte: new Date(new Date(afterRun.createdAt).getTime() + 1),
+      },
+      extraContext: {
+        currentStageId: state.currentStageId,
+        currentStageType: state.currentStageType,
+        currentStatusVersion: issue.statusVersion,
+        reviewRecoveryAttribution: { reason: attribution, previousRunId: afterRun.id },
+        reviewRecoveryInstruction:
+          "This execution-review stage is pending for you in its current round. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+      },
+    });
+    return run ? { run, outcome: "queued" } : declined("enqueue_declined");
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -4639,6 +4819,24 @@ export function recoveryService(
         issue.id,
       );
       if (activeRecoveryAction?.ownerType === "board") {
+        logger.warn(
+          {
+            issueId: issue.id,
+            issueStatus: issue.status,
+            issueStatusVersion: issue.statusVersion,
+            executionStateStatus: pendingExecutionState?.status ?? null,
+            executionStageId: pendingExecutionState?.currentStageId ?? null,
+            participantAgentId,
+            latestRunId: latestRun?.id ?? null,
+            latestRunStatus: latestRun?.status ?? null,
+            latestRunErrorCode: latestRun?.errorCode ?? null,
+            latestRunRetryReason: readNonEmptyString(parseObject(latestRun?.contextSnapshot).retryReason),
+            recoveryActionId: activeRecoveryAction.id,
+            recoveryOwnerType: activeRecoveryAction.ownerType,
+            decision: "board_recovery_skip",
+          },
+          "Review recovery decision: board-owned recovery action already owns the continuation path",
+        );
         result.skipped += 1;
         continue;
       }
@@ -4713,7 +4911,48 @@ export function recoveryService(
           continue;
         }
       }
-      if (await isInvocationBudgetBlocked(issue, agentId)) {
+      const participantRecoveryContextForBudget =
+        issue.status === "in_review" && pendingExecutionState && participantLatestRunForRecovery
+          ? parseObject(participantLatestRunForRecovery.contextSnapshot)
+          : null;
+      const currentReviewRecoveryBudgetBypass = Boolean(
+        participantRecoveryContextForBudget &&
+          participantLatestRunForRecovery &&
+          participantRecoveryContextForBudget.currentStageId === pendingExecutionState?.currentStageId &&
+          Number.isInteger(Number(participantRecoveryContextForBudget.currentStatusVersion)) &&
+          Number(issue.statusVersion) >= Number(participantRecoveryContextForBudget.currentStatusVersion) &&
+          Number(issue.statusVersion) <= Number(participantRecoveryContextForBudget.currentStatusVersion) + 1 &&
+          readNonEmptyString(participantRecoveryContextForBudget.retryReason) === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON &&
+          UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(participantLatestRunForRecovery.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number]),
+      );
+      const invocationBudgetBlocked = await isInvocationBudgetBlocked(issue, agentId);
+      if (invocationBudgetBlocked && currentReviewRecoveryBudgetBypass) {
+        const recoveryAttempts = readReviewRecoveryMaxAttempts();
+        const currentRoundFailedRecoveryCount = await countCurrentRoundFailedReviewRecoveries(
+          issue,
+          participantAgentId!,
+          pendingExecutionState!,
+          recoveryAttempts,
+          Number(participantRecoveryContextForBudget!.currentStatusVersion),
+        );
+        logger.warn(
+          {
+            issueId: issue.id,
+            issueStatus: issue.status,
+            issueStatusVersion: issue.statusVersion,
+            executionStageId: pendingExecutionState?.currentStageId ?? null,
+            participantAgentId,
+            participantRunId: participantLatestRunForRecovery?.id ?? null,
+            participantRunStatus: participantLatestRunForRecovery?.status ?? null,
+            participantRunRetryReason: readNonEmptyString(participantRecoveryContextForBudget.retryReason),
+            countCurrentRoundFailedRecoveries: currentRoundFailedRecoveryCount,
+            recoveryAttempts,
+            decision: "allow_current_round_recovery_before_invocation_budget",
+          },
+          "Review recovery decision: allow the current-round recovery before the invocation budget gate",
+        );
+      }
+      if (invocationBudgetBlocked && !currentReviewRecoveryBudgetBypass) {
         const classification = classifyContinuationFailure(latestRun);
         if (
           classification.kind === "deliberate_wait_without_target" ||
@@ -5126,7 +5365,45 @@ export function recoveryService(
           continue;
         }
 
-        if (!agentInvokable) {
+        // A recovery failure of the current stage/status version must enter
+        // this round's budget decision first. After an adapter failure the
+        // participant may briefly read as error, unknown, or org-chain not
+        // invokable; an already-recorded current-round failure must not be
+        // settled early as "participant unavailable". Pause gates, approvals,
+        // and the other native rejections stay in the branches before this
+        // one and inside the requeue entry.
+        const recoveryContext = parseObject(participantLatestRun.contextSnapshot);
+        const sameRoundRecoveryComment = await hasCurrentReviewRecoveryComment(issue, participantLatestRun);
+        const staleRound = staleReviewRoundReason(participantLatestRun, issue, pendingExecutionState, sameRoundRecoveryComment);
+        const currentRoundFailedDespiteAgentGate =
+          recoveryContext.currentStatusVersion != null &&
+          !staleRound &&
+          readNonEmptyString(recoveryContext.retryReason) === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON &&
+          UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(participantLatestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number]);
+        if (!agentInvokable && !currentRoundFailedDespiteAgentGate) {
+          logger.warn(
+            {
+              issueId: issue.id,
+              issueStatus: issue.status,
+              issueStatusVersion: issue.statusVersion,
+              executionStateStatus: pendingExecutionState.status,
+              executionStageId: pendingExecutionState.currentStageId,
+              participantAgentId,
+              participantAgentInvokable: agentInvokable,
+              participantRunId: participantLatestRun.id,
+              participantRunStatus: participantLatestRun.status,
+              participantRunErrorCode: participantLatestRun.errorCode ?? null,
+              participantRunStageId: readNonEmptyString(recoveryContext.currentStageId) ??
+                readNonEmptyString(parseObject(recoveryContext.executionStage).stageId),
+              participantRunStatusVersion: recoveryContext.currentStatusVersion ?? null,
+              participantRunRetryReason: readNonEmptyString(recoveryContext.retryReason),
+              sameRoundRecoveryComment,
+              staleRound,
+              currentRoundFailedDespiteAgentGate,
+              decision: "participant_unavailable_board_escalation",
+            },
+            "Review recovery decision: participant unavailable, escalating to the board",
+          );
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",
@@ -5143,12 +5420,75 @@ export function recoveryService(
           continue;
         }
 
-        if (
-          didAutomaticRecoveryFail(
-            participantLatestRun,
-            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-          )
-        ) {
+        // Rounds of an older stage or status version (including one cancelled
+        // by its own handoff) are not this round's recovery failures: requeue
+        // them toward the current round. A current-round recovery failure is
+        // requeued while within the attempt budget and escalates once the
+        // budget is exhausted. A current-round failure recorded before
+        // versioning existed keeps the native escalation.
+        const currentRoundRecoveryFailed =
+          !staleRound &&
+          readNonEmptyString(recoveryContext.retryReason) === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON &&
+          UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(participantLatestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number]);
+        const recoveryAttempts = readReviewRecoveryMaxAttempts();
+        const currentRoundFailedRecoveryCount =
+          currentRoundRecoveryFailed && recoveryContext.currentStatusVersion != null
+            ? await countCurrentRoundFailedReviewRecoveries(
+                issue,
+                participantAgentId,
+                pendingExecutionState,
+                recoveryAttempts,
+                Number(recoveryContext.currentStatusVersion),
+              )
+            : null;
+        const retryCurrentRound =
+          currentRoundRecoveryFailed &&
+          currentRoundFailedRecoveryCount != null &&
+          currentRoundFailedRecoveryCount < recoveryAttempts;
+        logger.warn(
+          {
+            issueId: issue.id,
+            issueStatus: issue.status,
+            issueStatusVersion: issue.statusVersion,
+            executionStateStatus: pendingExecutionState.status,
+            executionStageId: pendingExecutionState.currentStageId,
+            participantAgentId,
+            participantAgentInvokable: agentInvokable,
+            participantRunId: participantLatestRun.id,
+            participantRunStatus: participantLatestRun.status,
+            participantRunErrorCode: participantLatestRun.errorCode ?? null,
+            participantRunStageId: readNonEmptyString(recoveryContext.currentStageId) ??
+              readNonEmptyString(parseObject(recoveryContext.executionStage).stageId),
+            participantRunStatusVersion: recoveryContext.currentStatusVersion ?? null,
+            participantRunRetryReason: readNonEmptyString(recoveryContext.retryReason),
+            sameRoundRecoveryComment,
+            staleRound,
+            currentRoundRecoveryFailed,
+            countCurrentRoundFailedRecoveries: currentRoundFailedRecoveryCount,
+            recoveryAttempts,
+            retryCurrentRound,
+            decision: staleRound
+              ? "requeue_stale_round"
+              : retryCurrentRound
+                ? "requeue_current_round_retry"
+                : currentRoundRecoveryFailed
+                  ? "escalate_current_round_exhausted"
+                  : "skip_non_recovery_failure",
+          },
+          "Review recovery decision",
+        );
+        if (staleRound || retryCurrentRound) {
+          const attribution = staleRound ?? "current_round_retry";
+          const requeued = await requeueCurrentReviewRound(issue, participantAgentId, pendingExecutionState, participantLatestRun, attribution);
+          if (requeued.run) {
+            result.reviewParticipantRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+        if (currentRoundRecoveryFailed) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",
@@ -5156,6 +5496,20 @@ export function recoveryService(
             notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
           });
+          logger.warn(
+            {
+              issueId: issue.id,
+              participantRunId: participantLatestRun.id,
+              staleRound,
+              currentRoundRecoveryFailed,
+              countCurrentRoundFailedRecoveries: currentRoundFailedRecoveryCount,
+              recoveryAttempts,
+              retryCurrentRound,
+              escalationOutcome: updated ? "escalated" : "escalation_declined",
+              decision: "escalate_current_round_exhausted",
+            },
+            "Review recovery decision: current-round recovery budget exhausted",
+          );
           if (updated) {
             result.escalated += 1;
             result.issueIds.push(issue.id);
@@ -5181,6 +5535,11 @@ export function recoveryService(
           continue;
         }
 
+        if (await hasPendingIssueApproval(issue)) {
+          result.skipped += 1;
+          continue;
+        }
+
         const reviewOutcome: { retryExhausted?: boolean } = {};
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
@@ -5192,6 +5551,7 @@ export function recoveryService(
           extraContext: {
             currentStageId: pendingExecutionState.currentStageId ?? null,
             currentStageType: pendingExecutionState.currentStageType ?? null,
+            currentStatusVersion: issue.statusVersion,
             reviewRecoveryInstruction:
               "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
           },

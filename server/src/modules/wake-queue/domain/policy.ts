@@ -393,10 +393,15 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
     if (shared.isStrandedRecoveryOrigin) {
       return { kind: "blocked_recovery_in_place" };
     }
-    const shouldBlock =
-      !shared.recoveryAgentInvokable ||
-      !shared.recoveryAgentPresent ||
-      reviewParticipant.isExecutionReviewParticipantRecoveryRun;
+    // A failed recovery round for the current stage/status version is settled by
+    // the stage/version budget reconciliation instead: releasing the lock must
+    // not project a recovery participant's failure onto blocked; the stranded
+    // sweep re-checks pause gates, approvals, status versions, and the bounded
+    // attempt budget.
+    if (reviewParticipant.isExecutionReviewParticipantRecoveryRun) {
+      return { kind: "released" };
+    }
+    const shouldBlock = !shared.recoveryAgentInvokable || !shared.recoveryAgentPresent;
     if (shouldBlock) {
       return { kind: "blocked", notice: "execution_review_participant" };
     }

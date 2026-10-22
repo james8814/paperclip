@@ -49,10 +49,12 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
+  assessLegacyExecutionEvidence,
   legacyExecutionNeedsReconciliationWithEvidence,
   settleInterruptedNativeBootstrap,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
+import { isPendingInteractionAddresseeRetry } from "../modules/run-dispatch/adapters/postgres.js";
 import {
   adapterExecutionControls,
   captureAdapterStopOwnership,
@@ -12940,23 +12942,30 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
 
     // Cancelling a queued run that never acquired provider execution is
-    // positive bootstrap evidence. It must not hold unrelated queued messages.
+    // positive bootstrap evidence. It must not hold unrelated queued
+    // messages. The verified marking is only written when the full
+    // persisted-evidence assessment agrees, and the cancel update is then
+    // pinned to the queued status so a concurrently claimed run is never
+    // clobbered.
     if (previousStatus && (status === "cancelled" || status === "interrupted")) {
       patch = { ...patch, resultJson: cancellationResultJson(previousStatus, status, patch?.resultJson, patch?.errorCode, patch?.error) };
     }
-    if (
+    const neverStarted =
       status === "cancelled" &&
       previousStatus?.status === "queued" &&
-      previousStatus.runtimeMode !== "native" &&
-      !previousStatus.startedAt &&
-      !previousStatus.processPid
-    ) {
+      (await assessLegacyExecutionEvidence(db, {
+        ...previousStatus,
+        ...patch,
+        status: previousStatus.status,
+        resultJson: patch?.resultJson ?? previousStatus.resultJson,
+      })).kind === "never_started";
+    if (neverStarted) {
       patch = {
         ...patch,
         resultJson: {
           ...previousStatus.resultJson,
           ...patch?.resultJson,
-          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false, queueCancellationVerified: true },
         },
       };
     }
@@ -12981,7 +12990,7 @@ export function heartbeatService(
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
-            .where(eq(heartbeatRuns.id, runId))
+            .where(and(eq(heartbeatRuns.id, runId), ...(neverStarted ? [eq(heartbeatRuns.status, "queued")] : [])))
             .returning()
             .then((rows) => rows[0] ?? null);
 
@@ -13033,20 +13042,27 @@ export function heartbeatService(
     }
 
     // Cancelling a queued run that never acquired provider execution is
-    // positive bootstrap evidence. It must not hold unrelated queued messages.
-    if (
+    // positive bootstrap evidence. It must not hold unrelated queued
+    // messages. The verified marking is only written when the full
+    // persisted-evidence assessment agrees, and the cancel update is then
+    // pinned to the queued status so a concurrently claimed run is never
+    // clobbered.
+    const neverStarted =
       status === "cancelled" &&
       previousStatus?.status === "queued" &&
-      previousStatus.runtimeMode !== "native" &&
-      !previousStatus.startedAt &&
-      !previousStatus.processPid
-    ) {
+      (await assessLegacyExecutionEvidence(db, {
+        ...previousStatus,
+        ...patch,
+        status: previousStatus.status,
+        resultJson: patch?.resultJson ?? previousStatus.resultJson,
+      })).kind === "never_started";
+    if (neverStarted) {
       patch = {
         ...patch,
         resultJson: {
           ...previousStatus.resultJson,
           ...patch?.resultJson,
-          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false, queueCancellationVerified: true },
         },
       };
     }
@@ -13076,6 +13092,7 @@ export function heartbeatService(
               and(
                 eq(heartbeatRuns.id, runId),
                 inArray(heartbeatRuns.status, fromStatuses),
+                ...(neverStarted ? [eq(heartbeatRuns.status, "queued")] : []),
                 ...(isHeartbeatRunTerminalStatus(status)
                   ? [nativeRunnerOwnershipNotHeldCondition()]
                   : []),
@@ -28165,6 +28182,14 @@ export function heartbeatService(
               return false;
             }
 
+            // A plain pending-card retry for the current addressee keeps its
+            // scheduled slot. It was admitted under native coordination, and
+            // later promotion or claim paths re-check the card and the
+            // remaining gates under their own locks.
+            if (!issueCancelled && (await isPendingInteractionAddresseeRetry(tx, issue, scheduledRun))) {
+              return false;
+            }
+
             const now = new Date();
             const reason = issueCancelled
               ? "Cancelled because the issue was cancelled before the scheduled retry became due"
@@ -28303,7 +28328,11 @@ export function heartbeatService(
             activeExecutionRun &&
             activeExecutionRun.status !== "running" &&
             issue.assigneeAgentId &&
-            activeExecutionRun.agentId !== issue.assigneeAgentId
+            activeExecutionRun.agentId !== issue.assigneeAgentId &&
+            // A pending-card addressee retry that already held the lock under
+            // native coordination must not be cleared from here; the later
+            // enqueue path re-checks the card before reusing the lock.
+            !(await isPendingInteractionAddresseeRetry(tx, issue, activeExecutionRun))
           ) {
             const cancelled = await tx
               .update(heartbeatRuns)

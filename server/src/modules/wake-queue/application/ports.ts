@@ -202,6 +202,15 @@ export interface WakeQueueTransaction {
   isAutomaticRecoverySuppressedByPauseHold(input: { companyId: string; issueId: string }): Promise<boolean>;
   /** Deny-only facts from the exact finishing run and its durable chat wake owner. */
   isImmediateRecoverySourceBlocked(input: { companyId: string; runId: string }): Promise<boolean>;
+  /** True while the current review round still has a wait path (execution
+   * blocker, pending approval, pending interaction, or explicit blocker);
+   * records one deduplicated review-round assessment activity entry. */
+  hasReviewRecoveryWaitPath(input: {
+    companyId: string;
+    issue: IssueSnapshot;
+    agentId: string;
+    now: Date;
+  }): Promise<boolean>;
   queueReviewParticipantRecoveryRun(input: {
     companyId: string;
     issue: IssueSnapshot;

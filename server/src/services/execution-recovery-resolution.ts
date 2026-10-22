@@ -1,5 +1,7 @@
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { assessLegacyExecutionEvidence, LEGACY_RECOVERY_CAUSE } from "./legacy-execution-recovery.js";
 import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
@@ -22,6 +24,92 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { parseObject } from "../adapters/utils.js";
+
+// Board-only verification for one specified hold. The caller must already
+// hold the task row lock and have passed the board, company, and trust
+// gates. Only the specified action is handled: the task is not modified, no
+// execution is dispatched, and a restored status or stage transition is
+// never granted.
+export async function verifyNeverStartedRecovery(input: {
+  db: Db;
+  task: typeof issues.$inferSelect;
+  actionId: string;
+  verification: {
+    runId: string;
+    expectedStatusVersion: number;
+    expectedAssigneeAgentId: string | null;
+    expectedAssigneeUserId: string | null;
+    expectedExecutionState: Record<string, unknown> | null;
+  };
+  sourceIssueStatus: string;
+  actorId: string;
+  resolutionNote: string;
+}): Promise<{
+  issue: typeof issues.$inferSelect;
+  recoveryAction: typeof issueRecoveryActions.$inferSelect;
+  verificationOnly: true;
+  replayed?: true;
+}> {
+  const { db, task, actionId, verification, sourceIssueStatus, actorId, resolutionNote } = input;
+  const reject = (reason: string) => {
+    throw conflict("Never-started verification rejected; the recovery hold is unchanged.", { code: "never_started_verification_rejected", reason, actionId });
+  };
+  if (sourceIssueStatus !== task.status || verification.expectedStatusVersion !== task.statusVersion ||
+    verification.expectedAssigneeAgentId !== task.assigneeAgentId || verification.expectedAssigneeUserId !== task.assigneeUserId ||
+    !isDeepStrictEqual(verification.expectedExecutionState, task.executionState)) reject("issue_snapshot_changed");
+  if (["done", "cancelled"].includes(task.status) || task.conversationAgentId) reject("unsupported_task_kind_or_status");
+  if (task.executionRunId || task.checkoutRunId) reject("issue_execution_owned");
+  const [coordinator] = await db.select().from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.companyId, task.companyId), eq(nativeRunFinalizations.runId, verification.runId))).for("update");
+  const [run] = await db.select().from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, task.companyId), eq(heartbeatRuns.id, verification.runId))).for("update");
+  const [action] = await db.select().from(issueRecoveryActions)
+    .where(and(eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id), eq(issueRecoveryActions.id, actionId))).for("update");
+  const evidence = action?.evidence ?? null;
+  const evidenceRunId = typeof evidence?.runId === "string" ? evidence.runId : undefined;
+  const evidenceSourceRunId = typeof evidence?.sourceRunId === "string" ? evidence.sourceRunId : undefined;
+  const contextIssueId = typeof run?.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : undefined;
+  if (!action || !run || action.kind !== "active_run_watchdog" || action.cause !== LEGACY_RECOVERY_CAUSE ||
+    (evidenceRunId ?? evidenceSourceRunId) !== run.id ||
+    (evidenceRunId && evidenceSourceRunId && evidenceRunId !== evidenceSourceRunId) ||
+    (run.nativeIssueId ?? contextIssueId) !== task.id ||
+    (run.nativeIssueId && contextIssueId && run.nativeIssueId !== contextIssueId) ||
+    run.status !== "cancelled") reject("action_or_run_identity_mismatch");
+  const assessment = await assessLegacyExecutionEvidence(db, run);
+  if (assessment.kind !== "never_started") reject(assessment.reason);
+  if (coordinator) reject("native_coordinator_present");
+  const live = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, task.companyId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`))).limit(1);
+  if (live.length) reject("live_issue_run");
+  const previous = evidence?.neverStartedVerification as { guard?: unknown } | undefined;
+  if (previous) {
+    if (action.status !== "resolved" || !isDeepStrictEqual(previous.guard, verification)) reject("verification_receipt_changed");
+    return { issue: task, recoveryAction: action, verificationOnly: true, replayed: true };
+  }
+  if (evidence?.executionReconciliation || evidence?.continuationDelivery) reject("existing_reconciliation_delivery");
+  const automaticRecovery = evidence?.automaticRecovery as Record<string, unknown> | undefined;
+  if (!["active", "escalated"].includes(action.status) &&
+    !((["resolved", "cancelled"].includes(action.status)) && automaticRecovery?.replay === "blocked")) reject("action_not_held");
+  const now = new Date();
+  const [resolved] = await db.update(issueRecoveryActions).set({
+    status: "resolved", outcome: "false_positive", resolvedAt: now, updatedAt: now,
+    wakePolicy: null, monitorPolicy: null,
+    resolutionNote,
+    nextAction: "Only this never-started execution hold was cleared. Existing review, approval, stop, dependencies and successor arrangements still apply. No replay or continuation was authorized.",
+    evidence: {
+      ...action.evidence,
+      automaticRecovery: { ...(automaticRecovery ?? {}), replay: "not_applicable_never_started" },
+      neverStartedVerification: { guard: verification, actorId, recordedAt: now.toISOString(), assessment, replayAuthorized: false },
+    },
+  }).where(and(eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id), eq(issueRecoveryActions.id, action.id))).returning();
+  await persistActivity(db, { companyId: task.companyId, actorType: "user", actorId,
+    action: "issue.recovery_action_never_started_verified", entityType: "issue", entityId: task.id, runId: run.id,
+    details: { recoveryActionId: action.id, reason: assessment.reason, outcome: "specified_hold_cleared", sourceIssueStatus: task.status,
+      statusVersion: task.statusVersion, stageId: task.executionState?.currentStageId ?? null, replayAuthorized: false } });
+  return { issue: task, recoveryAction: resolved ?? action, verificationOnly: true };
+}
 
 // Mirrors upstream PR #16291 (services/execution-identity.ts): coerce run
 // evidence text to a canonical uuid before comparing it with uuid columns, so
@@ -471,6 +559,25 @@ export async function settleUnrecoverableExecutions(
           )
         )
           return;
+        // A review-participant recovery round is reconciled by the stage and
+        // status version budget; the generic closer must not project it onto
+        // blocked early.
+        if (parseObject(run.contextSnapshot).retryReason === "execution_review_participant_recovery") return;
+        const executionAssessment = await assessLegacyExecutionEvidence(tx as unknown as Db, run);
+        if (executionAssessment.kind === "never_started") {
+          // An existing mistaken hold is left in place for board
+          // verification; the pending review projection is no longer written
+          // as blocked.
+          const previousAssessment = action.evidence.neverStartedAssessment as { reason?: string } | undefined;
+          if (previousAssessment?.reason !== executionAssessment.reason) {
+            await tx.update(issueRecoveryActions).set({ evidence: { ...action.evidence, neverStartedAssessment: executionAssessment } })
+              .where(and(eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.id, action.id)));
+            await persistActivity(tx as unknown as Db, { companyId: task.companyId, actorType: "system", actorId: "execution-recovery",
+              action: "issue.execution_recovery_assessed", entityType: "issue", entityId: task.id, runId: run.id,
+              details: { recoveryActionId: action.id, reason: executionAssessment.reason, outcome: "hold_retained_for_board_verification", replayAuthorized: false } });
+          }
+          return;
+        }
         // Give durable native recovery its chance; never preempt a resume,
         // replacement, result finalizer, or still-owned execution.
         if (
@@ -537,6 +644,7 @@ export async function settleUnrecoverableExecutions(
                 runId: run.id,
                 replay: "blocked",
                 actionOutcome: "unknown",
+                executionAssessment,
                 recordedAt: now.toISOString(),
               },
             },
@@ -554,6 +662,7 @@ export async function settleUnrecoverableExecutions(
             recoveryActionId: action.id,
             outcome: current ? "blocked" : "cancelled",
             replay: "not_authorized",
+            executionAssessment,
           },
         });
         await tx

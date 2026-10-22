@@ -4,6 +4,7 @@ import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
 import { summarizeRunErrorForModel } from "./heartbeat-run-summary.js";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -20,6 +21,9 @@ type IssueSummaryInput = {
   description: string | null;
   status: string;
   priority: string;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  executionState?: unknown;
 };
 
 type RunSummaryInput = {
@@ -100,9 +104,37 @@ function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
   return "implementation";
 }
 
+// Only the platform's current native return-to-executor state counts; a summary
+// or wake context claiming a return is never trusted on its own.
+export function isIssueReturnedToExecutor(
+  issue: {
+    status?: string;
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
+    executionState?: unknown;
+  } | null | undefined,
+  agentId: string | null | undefined,
+): boolean {
+  const state = parseIssueExecutionState(issue?.executionState);
+  return Boolean(
+    agentId &&
+      issue?.status === "in_progress" &&
+      issue.assigneeAgentId === agentId &&
+      !issue.assigneeUserId &&
+      state?.status === "changes_requested" &&
+      state.lastDecisionOutcome === "changes_requested" &&
+      (state.currentStageType === "review" || state.currentStageType === "approval") &&
+      state.returnAssignee?.type === "agent" &&
+      state.returnAssignee.agentId === agentId,
+  );
+}
+
 function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previousNextAction: string | null) {
   if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
   if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
+  if (isIssueReturnedToExecutor(issue, issue.assigneeAgentId)) {
+    return "Address the latest requested changes, then resubmit through the current review or approval stage.";
+  }
   if (run.status === "failed" || run.status === "timed_out") {
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }
@@ -262,6 +294,9 @@ export async function refreshIssueContinuationSummary(input: {
         description: issues.description,
         status: issues.status,
         priority: issues.priority,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        executionState: issues.executionState,
       })
       .from(issues)
       .where(eq(issues.id, issueId))

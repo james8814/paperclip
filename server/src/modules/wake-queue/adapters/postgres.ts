@@ -10,6 +10,9 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  approvals,
+  issueApprovals,
+  issueThreadInteractions,
   chatActions,
   heartbeatRuns,
   issueComments,
@@ -112,6 +115,7 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     companyId: row.companyId,
     identifier: row.identifier ?? "",
     status: row.status,
+    statusVersion: row.statusVersion,
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
     hiddenAt: row.hiddenAt,
@@ -568,6 +572,84 @@ function buildTransaction(
       return isAutomaticRecoverySuppressedByPauseHold(tx, companyId, issueId, treeControlSvc);
     },
 
+    // True while the current review round still has a wait path: an
+    // execution blocker, a pending approval, a pending interaction wake, or
+    // an explicit blocker edge. Writes one deduplicated review-round
+    // assessment activity entry describing the wait.
+    async hasReviewRecoveryWaitPath({ companyId, issue, agentId, now }) {
+      if (companyId !== run.companyId || companyId !== issue.companyId)
+        throw new Error("wake-queue: review recovery company mismatch");
+      let reason: string | null = null;
+      if (await getExecutionBlocker(tx, companyId, issue.id)) reason = "execution_blocker";
+      if (!reason) {
+        const [approval] = await tx
+          .select({ id: approvals.id })
+          .from(issueApprovals)
+          .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+          .where(
+            and(
+              eq(issueApprovals.companyId, companyId),
+              eq(issueApprovals.issueId, issue.id),
+              eq(approvals.companyId, companyId),
+              eq(approvals.status, "pending"),
+            ),
+          )
+          .limit(1);
+        if (approval) reason = "pending_approval";
+      }
+      if (!reason) {
+        const [interaction] = await tx
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.companyId, companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.status, "pending"),
+              inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+            ),
+          )
+          .limit(1);
+        if (interaction) reason = "pending_interaction";
+      }
+      if (!reason && (await this.hasExplicitBlockerPath({ companyId, issueId: issue.id }))) reason = "explicit_blocker";
+      if (!reason) return false;
+      const details = {
+        reason,
+        agentId,
+        stageId: parseIssueExecutionState(issue.executionState)?.currentStageId ?? null,
+        statusVersion: issue.statusVersion,
+        path: "wake_queue_release",
+      };
+      const [previous] = await tx
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issue.id),
+            eq(activityLog.action, "issue.review_round_assessed"),
+          ),
+        )
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .limit(1);
+      if (!previous || !Object.keys(details).every((key) => previous.details?.[key] === details[key]))
+        await tx.insert(activityLog).values({
+          companyId,
+          actorType: "system",
+          actorId: "system",
+          action: "issue.review_round_assessed",
+          entityType: "issue",
+          entityId: issue.id,
+          agentId: null,
+          runId: null,
+          details,
+          createdAt: now,
+        });
+      return true;
+    },
+
     async isImmediateRecoverySourceBlocked({ companyId, runId }) {
       if (companyId !== run.companyId || runId !== run.id) {
         throw new Error(
@@ -612,6 +694,7 @@ function buildTransaction(
               retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               currentStageId: executionState?.currentStageId ?? null,
               currentStageType: executionState?.currentStageType ?? null,
+              currentStatusVersion: issue.statusVersion,
             },
             "normal_model",
           ),
@@ -642,6 +725,7 @@ function buildTransaction(
               retryOfRunId: finishingRun.id,
               currentStageId: executionState?.currentStageId ?? null,
               currentStageType: executionState?.currentStageType ?? null,
+              currentStatusVersion: issue.statusVersion,
               reviewRecoveryInstruction:
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
             },

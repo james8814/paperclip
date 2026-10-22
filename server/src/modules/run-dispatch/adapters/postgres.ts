@@ -1,4 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
+import { assessLegacyExecutionEvidence } from "../../../services/legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -17,6 +18,7 @@ import {
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "../../../services/issue-thread-interaction-resolution.js";
 import { budgetService } from "../../../services/budgets.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
@@ -33,6 +35,7 @@ import {
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
+  isIssueReturnedToExecutor,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
@@ -122,6 +125,76 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+// Card wakes are recognized from the database only. The run context decides
+// whether this evaluation applies at all and provides the card id: the first
+// round has wakeReason "interaction_pending"; a native bounded retry
+// overwrites wakeReason with its retry reason but carries the first round's
+// source and card id and records retryOfRunId. The addressee, the owning
+// issue and company, the pending status, and the native addressee authority
+// all come from the persisted card. Only the first round and plain bounded
+// retries (retryReasonKind "other") are covered: continuation, disposition
+// repair, AI connection waits, and native safe replacement keep their native
+// owner and execution-lock rules and return null here.
+const INTERACTION_PENDING_WAKE_SOURCE = "issue.interaction.created";
+export async function readPendingInteractionAddressee(dbOrTx: Db, input: {
+  companyId: string;
+  issueId: string;
+  agentId: string;
+  contextSnapshot: unknown;
+  retryReasonKind: string;
+}): Promise<{ interactionId: string | null; status: string | null; addresseeActive: boolean } | null> {
+  const context = parseObject(input.contextSnapshot);
+  const claimsCardWake = readNonEmptyString(context.wakeReason) === "interaction_pending" ||
+    (readNonEmptyString(context.source) === INTERACTION_PENDING_WAKE_SOURCE && readNonEmptyString(context.retryOfRunId) !== null);
+  if (!claimsCardWake || input.retryReasonKind !== "other") return null;
+  const interactionId = readNonEmptyString(context.interactionId);
+  if (!interactionId) return { interactionId: null, status: null, addresseeActive: false };
+  const interaction = await dbOrTx
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId)))
+    .then((rows) => rows[0] ?? null);
+  const status = interaction?.status ?? null;
+  const addresseeActive = Boolean(interaction &&
+    status === "pending" &&
+    interaction.addresseeAgentId === input.agentId &&
+    issueThreadInteractionAttentionAgentAllowed({
+      agentId: input.agentId,
+      interaction,
+      governedAction: interaction.kind === "request_confirmation" &&
+        typeof interaction.payload === "object" &&
+        interaction.payload !== null &&
+        "toolAction" in interaction.payload &&
+        (interaction.payload as Record<string, unknown>).toolAction !== undefined,
+    }));
+  return { interactionId, status, addresseeActive };
+}
+
+// heartbeat enqueue and promotion/claim share this card rule; the addressee
+// or status is never taken from the run context.
+export async function isPendingInteractionAddresseeRetry(dbOrTx: Db, issue: {
+  id: string;
+  companyId: string;
+  status: string;
+}, run: {
+  status: string;
+  companyId: string;
+  agentId: string;
+  contextSnapshot: unknown;
+  scheduledRetryReason: string | null;
+}): Promise<boolean> {
+  const context = parseObject(run.contextSnapshot);
+  if (run.status !== "scheduled_retry" || issue.status === "cancelled" ||
+    run.companyId !== issue.companyId || readNonEmptyString(context.issueId) !== issue.id)
+    return false;
+  const pending = await readPendingInteractionAddressee(dbOrTx, {
+    companyId: issue.companyId, issueId: issue.id, agentId: run.agentId,
+    contextSnapshot: context,
+    retryReasonKind: classifyRetryReasonKind(readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason),
+  });
+  return pending?.addresseeActive === true;
 }
 
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
@@ -304,6 +377,7 @@ export function createPostgresRunDispatchAdapter(
       activePauseHold: null,
       dependenciesBlocked: null,
       dispositionRepair: null,
+      pendingInteraction: null,
     };
     const isBlocked = () => !decideScheduledRetryGate(facts, now).allowed;
 
@@ -359,6 +433,13 @@ export function createPostgresRunDispatchAdapter(
     facts.issueAssigneeAgentId = issue.assigneeAgentId;
     facts.issueExecutionRunId = issue.executionRunId;
     facts.issueCheckoutRunId = issue.checkoutRunId;
+    // Re-read the persisted card by id on every evaluation and promotion
+    // (under the same issue lock when a transaction is open), before the
+    // ownership gate.
+    facts.pendingInteraction = await readPendingInteractionAddressee(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId,
+      contextSnapshot: input.contextSnapshot, retryReasonKind,
+    });
     if (input.conversationContinuation) {
       const [interactions, linkedApprovals] = await Promise.all([
         dbOrTx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
@@ -517,6 +598,7 @@ export function createPostgresRunDispatchAdapter(
         id: issues.id,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
@@ -541,8 +623,13 @@ export function createPostgresRunDispatchAdapter(
       interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
     const isResolvedInteractionContinuation = isResolvedInteractionContinuationWakeContext(context);
 
+    // The freshest native return decision inside the task lock outranks any
+    // older or newer continuation summary. Only the current owner that is a
+    // legitimate returnAssignee gets released from the summary park; all
+    // other native gates still run.
     const continuationParkApplies = Boolean(
       issue &&
+        !isIssueReturnedToExecutor(issue, input.agentId) &&
         issue.status === "in_progress" &&
         !wakeCommentId &&
         !hasResolvedInteractionEvidence &&
@@ -582,6 +669,9 @@ export function createPostgresRunDispatchAdapter(
         : false;
 
     const retryReasonKind = classifyRetryReasonKind(retryReason);
+    const pendingInteraction = issue
+      ? await readPendingInteractionAddressee(dbOrTx, { companyId: input.companyId, issueId: issue.id, agentId: input.agentId, contextSnapshot: context, retryReasonKind })
+      : null;
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
     const readiness = issue && retryReasonKind === "native_safe_replacement"
@@ -605,6 +695,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      pendingInteraction,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -867,6 +958,7 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
   ): Promise<CancelStaleQueuedRunOutcome> {
+      const executionAssessment = await assessLegacyExecutionEvidence(tx, { ...run, errorCode: decision.errorCode });
       const [row] = await tx
         .update(heartbeatRuns)
         .set({
@@ -877,6 +969,7 @@ export function createPostgresRunDispatchAdapter(
           resultJson: {
             ...parseObject(run.resultJson),
             stopReason: decision.errorCode,
+            ...(executionAssessment.kind === "never_started" ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false, queueCancellationVerified: true } } : {}),
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),
@@ -935,8 +1028,11 @@ export function createPostgresRunDispatchAdapter(
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: decision.reason,
-        payload: decision.details,
+        // The dedicated queue receipt is only written when the full
+        // cross-verification passed and the cancellation CAS succeeded; the
+        // original reason stays in the payload either way.
+        message: executionAssessment.kind === "never_started" ? "Queued run cancelled before execution" : decision.reason,
+        payload: { ...decision.details, reason: decision.reason, executionAssessment },
       });
 
       return {
@@ -978,7 +1074,9 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
       const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
       if (!decision.stale || !issueId) {
-        if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
+        // The verified addressee of a pending card keeps lock-accepted
+        // non-assignee authority the same way a comment wake does.
+        if (input.expectedStatus === "queued" && (facts?.isInteractionWake || facts?.pendingInteraction?.addresseeActive)) {
           // Preserve the authority accepted under the issue/run locks. Later
           // preflight reads can observe a reassignment; they must not turn an
           // assignee comment into a non-assignee subscription-wait exception.

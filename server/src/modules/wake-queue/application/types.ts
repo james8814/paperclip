@@ -33,6 +33,7 @@ export type IssueSnapshot = {
   companyId: string;
   identifier: string;
   status: string;
+  statusVersion: number;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   hiddenAt: Date | null;

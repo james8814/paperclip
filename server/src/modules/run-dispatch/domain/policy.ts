@@ -48,7 +48,16 @@ export type ReviewParticipantFacts = {
   currentParticipant: Record<string, unknown> | null;
 };
 
+/** Present only for an interaction_pending wake or its plain bounded retry;
+ * read from the persisted interaction under the issue lock. */
+export type PendingInteractionFacts = {
+  interactionId: string | null;
+  status: string | null;
+  addresseeActive: boolean;
+};
+
 export type ScheduledRetryGateErrorCode =
+  | "issue_interaction_not_pending"
   | "agent_not_invokable"
   | "heartbeat_wake_on_demand_disabled"
   | "budget_blocked"
@@ -97,6 +106,8 @@ export type ScheduledRetryFacts = {
   issueCheckoutRunId?: string | null;
 
   isNonAssigneeWorkspaceBusyRetry: boolean;
+  /** Present only for an interaction_pending wake or its plain bounded retry. */
+  pendingInteraction?: PendingInteractionFacts | null;
   reviewParticipant: ReviewParticipantFacts;
   activePauseHold: PauseHoldFacts | null;
   dependenciesBlocked: DependencyBlockFacts | null;
@@ -108,6 +119,7 @@ export type ScheduledRetryFacts = {
 };
 
 export type QueuedRunStalenessErrorCode =
+  | "issue_interaction_not_pending"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -146,6 +158,8 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /** Present only for an interaction_pending wake or its plain bounded retry. */
+  pendingInteraction?: PendingInteractionFacts | null;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -170,6 +184,9 @@ type OwnershipFacts = {
   issueAssigneeAgentId: string | null;
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
+  /** The verified addressee of a still-pending native card (re-checked
+   * against the database by the adapter at promotion time). */
+  isPendingInteractionAddressee?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -185,6 +202,9 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.issueAssigneeAgentId === facts.runAgentId) return "current_owner";
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
+  // The real addressee of a still-pending native card, verified against the
+  // database by the adapter.
+  if (facts.isPendingInteractionAddressee) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -341,12 +361,33 @@ export function decideScheduledRetryGate(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
+    // The verified addressee of a still-pending native card (re-read from
+    // the database by the adapter at promotion time), matching the queued
+    // gate's decision.
+    isPendingInteractionAddressee: facts.pendingInteraction?.addresseeActive === true,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.hasParticipant &&
       facts.reviewParticipant.participantIsAgent &&
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
   });
+  if (ownership === "reassigned" && facts.pendingInteraction) {
+    // The card was answered, expired, withdrawn, missing, or no longer this
+    // agent's: cancel as before, but record the real reason instead of
+    // claiming someone else will be woken.
+    return {
+      allowed: false,
+      reason: "Scheduled retry suppressed because the addressed interaction is not pending for this agent; no replacement wake was queued",
+      errorCode: "issue_interaction_not_pending",
+      issueId: facts.issueId,
+      details: {
+        issueId: facts.issueId,
+        interactionId: facts.pendingInteraction.interactionId,
+        interactionStatus: facts.pendingInteraction.status,
+        currentAssigneeAgentId: facts.issueAssigneeAgentId,
+      },
+    };
+  }
   if (ownership === "reassigned") {
     return {
       allowed: false,
@@ -431,6 +472,9 @@ export function decideScheduledRetryGate(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
+    // The verified addressee of a pending card is not the stage reviewer and
+    // is exempt from the participant gate, same as a comment wake.
+    bypass: facts.pendingInteraction?.addresseeActive === true,
   });
   if (participantOutcome === "participant_changed") {
     return {
@@ -566,12 +610,29 @@ export function decideQueuedRunStaleness(
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
+    isPendingInteractionAddressee: facts.pendingInteraction?.addresseeActive === true,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
     isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
   });
+  if (ownership === "reassigned" && facts.pendingInteraction) {
+    // The card was answered, expired, withdrawn, or is no longer this
+    // agent's: cancel as before, but record the real reason instead of
+    // claiming someone else will be woken.
+    return {
+      stale: true,
+      errorCode: "issue_interaction_not_pending",
+      reason: "Cancelled because the addressed interaction is not pending for this agent before the queued run could start; no replacement wake was queued",
+      details: {
+        issueId: facts.issueId,
+        interactionId: facts.pendingInteraction.interactionId,
+        interactionStatus: facts.pendingInteraction.status,
+        currentAssigneeAgentId: facts.issueAssigneeAgentId,
+      },
+    };
+  }
   if (ownership === "reassigned") {
     return {
       stale: true,
@@ -661,7 +722,9 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    // The verified addressee of a pending card is exempt from the
+    // participant gate, same as a comment wake.
+    bypass: facts.wakeCommentIdPresent || facts.pendingInteraction?.addresseeActive === true,
   });
   if (participantOutcome === "participant_changed") {
     return {

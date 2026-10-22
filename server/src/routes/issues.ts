@@ -10,6 +10,7 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
+  verifyNeverStartedRecovery,
   validateExecutionReconciliation,
   markExecutionReconciliation,
 } from "../services/execution-recovery-resolution.js";
@@ -1426,6 +1427,11 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "budget.blocked",
   "company.inactive",
   "execution_reconciliation_required",
+  "interaction_pending",
+  "execution_review_participant_recovery",
+  "issue_state_guard_mismatch",
+  "issue_continuation_needed",
+  "execution_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -9183,9 +9189,25 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
+  const resolveWithNeverStartedVerificationSchema = z.union([
+    resolveIssueRecoveryActionSchema,
+    z.object({
+      actionId: z.string().guid(),
+      outcome: z.literal("restored"),
+      sourceIssueStatus: z.enum(["todo", "in_progress", "in_review", "blocked"]),
+      resolutionNote: z.string().trim().min(20).max(12000),
+      neverStartedVerification: z.object({
+        runId: z.string().guid(),
+        expectedStatusVersion: z.number().int().nonnegative(),
+        expectedAssigneeAgentId: z.string().guid().nullable(),
+        expectedAssigneeUserId: z.string().min(1).nullable(),
+        expectedExecutionState: z.record(z.string(), z.unknown()).nullable(),
+      }).strict(),
+    }).strict(),
+  ]);
   router.post(
     "/issues/:id/recovery-actions/resolve",
-    validate(resolveIssueRecoveryActionSchema),
+    validate(resolveWithNeverStartedVerificationSchema),
     async (req, res) => {
       const id = req.params.id as string;
       const existing = await getAccessibleResource(
@@ -9238,7 +9260,9 @@ export function issueRoutes(
         sourceIssueStatus,
         resolutionNote,
         executionReconciliation,
+        neverStartedVerification,
       } = req.body;
+      if (neverStartedVerification) assertBoard(req);
       if (outcome === "false_positive" || outcome === "cancelled") {
         assertBoard(req);
       }
@@ -9260,6 +9284,21 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+
+        if (neverStartedVerification) {
+          // Board verification is not replay authorization: no
+          // restored-to-todo transition, no stage change, and no clearing of
+          // other actions.
+          return verifyNeverStartedRecovery({
+            db: tx,
+            task: lockedIssue,
+            actionId,
+            verification: neverStartedVerification,
+            sourceIssueStatus,
+            actorId: actor.actorId,
+            resolutionNote,
+          });
+        }
 
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
@@ -9638,6 +9677,16 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      if (result.verificationOnly) {
+        res.json({
+          issue: result.issue,
+          recoveryAction: result.recoveryAction,
+          replayed: Boolean(result.replayed),
+          replayAuthorized: false,
+          executionBlocker: await getExecutionBlocker(db, result.issue.companyId, result.issue.id),
+        });
+        return;
+      }
       if (result.replayed) {
         res.json({
           issue: result.issue,

@@ -313,6 +313,37 @@ async function runReleaseDrain(
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
+    // A deferred recovery wake may have been queued before an approval was
+    // created; promotion must re-check. While the wait path exists the
+    // deferred wake is kept (no claim and no new run this round); the native
+    // state update that follows the approval clearing takes over.
+    // The recovery reason may be persisted either in the deferred context
+    // seed or in the wake row's reason. Both shapes are native queue
+    // records; checking only the seed misses rows created by the recovery
+    // enqueue path.
+    const deferredRetryReason = readNonEmptyString(workingCandidate.deferredContextSeed?.retryReason) ??
+      readNonEmptyString(workingCandidate.reason);
+    const deferredWakeReason = readNonEmptyString(workingCandidate.deferredContextSeed?.wakeReason) ??
+      readNonEmptyString(workingCandidate.wakeReason);
+    const deferredReviewRecovery = deferredRetryReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON ||
+      deferredWakeReason === "execution_review_participant_recovery";
+    const deferredReviewParticipant = currentAgentParticipant(issue);
+    if (
+      deferredReviewRecovery &&
+      issue.status === "in_review" &&
+      !issue.assigneeUserId &&
+      deferredReviewParticipant?.agentId === workingCandidate.agentId &&
+      (await ports.transaction.hasReviewRecoveryWaitPath({
+        companyId: issue.companyId,
+        issue,
+        agentId: workingCandidate.agentId,
+        now: input.now,
+      }))
+    ) {
+      handoffWakeIds.push(workingCandidate.id);
+      continue;
+    }
+
     const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
     if (!promoted) continue;
     return promoted;
@@ -540,6 +571,18 @@ async function runReleaseRecoveryTail(
           issueId: issue.id,
         })
       : false;
+
+  // The current round still has a real wait path (execution blocker, pending
+  // approval, pending interaction, or explicit blocker): release without
+  // queuing another recovery run and record the assessment.
+  if (reviewParticipantApplies && (await transaction.hasReviewRecoveryWaitPath({
+    companyId: issue.companyId,
+    issue,
+    agentId: run.agentId,
+    now: input.now,
+  }))) {
+    return { outcome: { kind: "released" }, postCommitEffects };
+  }
 
   const hasExistingExecutionPath = reviewParticipantApplies
     ? await transaction.hasExistingExecutionPath({
