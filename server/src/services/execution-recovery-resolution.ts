@@ -2,7 +2,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { assessLegacyExecutionEvidence, LEGACY_RECOVERY_CAUSE } from "./legacy-execution-recovery.js";
-import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker, persistedConversationProcessLiveness } from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
@@ -172,19 +172,12 @@ export async function validateExecutionReconciliation(input: {
       (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
     throw conflict("Verify safe workspace staging or repair and record workspaceRepairEvidence before continuing this run.");
   }
-  for (const pid of [
-    run.processPid,
-    run.processGroupId ? -run.processGroupId : null,
-  ]) {
-    if (!pid) continue;
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") continue;
-      throw conflict(
-        "The previous provider's process ownership cannot be verified.",
-      );
-    }
+  // Same recycled-pid/group misjudgment as the ownership blocker: a reused
+  // pid or process-group id answers kill(0) even though the original
+  // provider is gone. The shared liveness probe treats a later process start
+  // as a recycle and checks group membership before holding.
+  const liveness = await persistedConversationProcessLiveness(run);
+  if (liveness.pidAlive || liveness.groupAlive) {
     throw conflict(
       "The previous provider is still running. Stop it before continuing.",
     );
