@@ -1436,7 +1436,7 @@ function projectTaskDrainQueueStatus(startedAt: string, rows: Array<{ status: st
     total += count;
     if (["skipped", "failed", "cancelled"].includes(status)) lost += count;
     else if (["claimed", "completed", "coalesced", "queued"].includes(status) &&
-      ["running", "succeeded"].includes(row.runStatus)) resumed += count;
+      ["running", "succeeded"].includes(row.runStatus ?? "")) resumed += count;
     else if (row.status === "queued" && row.runStatus === "queued" ||
       row.status === "deferred_issue_execution" && row.runStatus === null) pending += count;
     else unknown += count;

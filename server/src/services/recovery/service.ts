@@ -2064,7 +2064,7 @@ export function recoveryService(
         assigneeAgentId: participantAgentId,
         statusVersion: issue.statusVersion ?? undefined,
         executionStageId: state.currentStageId ?? undefined,
-        executionStateStatus: state.status,
+        executionStateStatus: state.status as "pending" | "changes_requested",
         requireNoAgentIssueRun: true,
         agentIssueRunCreatedAtGte: receipt.requestedAt,
       },
