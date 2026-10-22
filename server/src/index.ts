@@ -1940,6 +1940,17 @@ async function startServerWithDatabaseTeardown(
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Maintenance shutdown keeps its own contract: a drain that is still
+    // running must reach natural native quiescence before anything stops,
+    // and every settle step must confirm completion. Regular signals keep
+    // the ordinary shutdown; a legitimate host stop is still re-verified
+    // against the persisted double-zero state.
+    const maintenanceStatus = heartbeat?.getTaskDrainStatus();
+    const maintenanceDrain = maintenanceStatus?.draining === true;
+    if (maintenanceDrain && !heartbeat.getTaskDrainStatus().quiescent) {
+      logger.error({ signal }, "STOP: maintenance requires natural native quiescence before shutdown");
+      return;
+    }
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
@@ -1974,7 +1985,9 @@ async function startServerWithDatabaseTeardown(
       await telemetryClient.flush();
     }
 
-    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+    // Maintenance does not cancel live runs through the ordinary shutdown
+    // drain; its own strict settle path owns the finalizers.
+    if (!maintenanceDrain && !skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
       try {
         const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
         logger.info({ signal, drain }, "graceful heartbeat run drain complete");
@@ -1983,7 +1996,7 @@ async function startServerWithDatabaseTeardown(
       }
     }
 
-    if (!skipHeartbeatDrain) {
+    if (!maintenanceDrain && !skipHeartbeatDrain) {
       await drainRunExecutionFinalizersForShutdown({
         signal,
         drain: drainHeartbeatExecutionFinalizers,
@@ -2015,18 +2028,41 @@ async function startServerWithDatabaseTeardown(
     // request in flight is drained against a working server and none reaches
     // a route once the pool is gone; the programmatic close below then finds
     // the listener already closed and skips.
-    await finalizeServerShutdown({
-      signal,
-      shutdownAppServices: appShutdown,
-      closeHttpListener: () =>
-        closeHttpListenerForShutdown({ server, signal, log: logger }),
-      drainPendingRunFailureReports: waitForPendingRunFailureReports,
-      closeDatabase: closeDatabaseClients,
-      stopEmbeddedPostgres,
-      shutdownInstrumentation,
-      shutdownSentry,
-      log: logger,
-    });
+    try {
+      await finalizeServerShutdown({
+        signal,
+        strictAcceptedInputs: maintenanceDrain,
+        settleAcceptedInputs: async () => {
+          const requireOwnedQuiescence = () => {
+            const current = heartbeat?.getTaskDrainStatus();
+            if (!maintenanceStatus?.startedAt || current?.draining !== true ||
+              String(current.startedAt) !== String(maintenanceStatus.startedAt) ||
+              current.quiescent !== true)
+              throw new Error("STOP: maintenance drain ownership or quiescence changed");
+          };
+          requireOwnedQuiescence();
+          const outcome = await drainRunExecutionFinalizersForShutdown({
+            signal, drain: drainHeartbeatExecutionFinalizers, log: logger,
+          });
+          requireOwnedQuiescence();
+          return outcome;
+        },
+        shutdownAppServices: appShutdown,
+        closeHttpListener: () =>
+          closeHttpListenerForShutdown({ server, signal, log: logger }),
+        drainPendingRunFailureReports: waitForPendingRunFailureReports,
+        closeDatabase: closeDatabaseClients,
+        stopEmbeddedPostgres,
+        shutdownInstrumentation,
+        shutdownSentry,
+        log: logger,
+      });
+    } catch (err) {
+      if (!maintenanceDrain)
+        throw err;
+      logger.error({ err, signal }, "STOP: maintenance shutdown incomplete; retain bytes and verify process/database state");
+      return;
+    }
 
     if (!exitProcess && server.listening) {
       await new Promise<void>((resolveClose, rejectClose) => {
@@ -2040,12 +2076,25 @@ async function startServerWithDatabaseTeardown(
     if (exitProcess) process.exit(0);
   };
 
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT", true);
-  });
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM", true);
-  });
+  // One settling shutdown operation shares a single promise; signal handlers
+  // stay installed after a STOP, so a repeat signal must never fall through
+  // to a default kill while settlement is in flight.
+  let shutdownInFlight: Promise<void> | null = null;
+  const coordinatedShutdown = (signal: "SIGINT" | "SIGTERM", exitProcess: boolean): Promise<void> => {
+    if (!shutdownInFlight) {
+      shutdownInFlight = shutdown(signal, exitProcess).finally(() => {
+        shutdownInFlight = null;
+      });
+    }
+    return shutdownInFlight;
+  };
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      void coordinatedShutdown(signal, true).catch((err) => {
+        logger.error({ err, signal }, "Coordinated shutdown failed");
+      });
+    });
+  }
 
   return {
     server,
@@ -2053,7 +2102,7 @@ async function startServerWithDatabaseTeardown(
     listenPort,
     apiUrl: configuredApiUrl,
     databaseUrl: activeDatabaseConnectionString,
-    shutdown: (signal = "SIGTERM") => shutdown(signal, false),
+    shutdown: (signal = "SIGTERM") => coordinatedShutdown(signal, false),
   };
   } catch (error) {
     if (startupListenerBound) {

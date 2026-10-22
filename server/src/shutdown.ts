@@ -128,6 +128,14 @@ export async function finalizeServerShutdown(input: {
   stopEmbeddedPostgres: (() => Promise<void>) | null;
   shutdownInstrumentation: () => Promise<void>;
   shutdownSentry: () => Promise<void>;
+  /** Maintenance mode: every step must confirm completion or the shutdown
+   * throws so the caller keeps the process (and its bytes) for verification,
+   * instead of a best-effort exit being mistaken for a durable barrier. */
+  strictAcceptedInputs?: boolean;
+  /** Settles the last batch of accepted inputs after the HTTP listener and
+   * internal producers are down. Must resolve to "drained"; a pre-close
+   * empty snapshot or a best-effort exit log never counts. */
+  settleAcceptedInputs?: () => Promise<string>;
   log: ShutdownLogger;
 }): Promise<void> {
   const { signal } = input;
@@ -136,9 +144,13 @@ export async function finalizeServerShutdown(input: {
   // away, so a request that is still in flight sees a fully working server.
   if (input.closeHttpListener) {
     try {
-      await input.closeHttpListener();
+      const closed = await input.closeHttpListener();
+      if (input.strictAcceptedInputs && !["closed", "not_listening"].includes(closed as string))
+        throw new Error("STOP: maintenance listener close is unconfirmed");
     } catch (err) {
       input.log.error({ err, signal }, "HTTP listener shutdown failed");
+      if (input.strictAcceptedInputs)
+        throw err;
     }
   }
 
@@ -149,6 +161,8 @@ export async function finalizeServerShutdown(input: {
     await input.shutdownAppServices?.();
   } catch (err) {
     input.log.error({ err, signal }, "Application service shutdown failed");
+    if (input.strictAcceptedInputs)
+      throw err;
   }
 
   // Wait for every in-flight run-failure Sentry report before the database
@@ -163,6 +177,15 @@ export async function finalizeServerShutdown(input: {
     }
   }
 
+  // Settle the last batch of accepted inputs only after the HTTP listener and
+  // internal producers are down. A pre-close empty snapshot, or a best-effort
+  // exit log, must never be mistaken for a durable preservation barrier.
+  if (input.strictAcceptedInputs) {
+    if (typeof input.settleAcceptedInputs !== "function" ||
+      (await input.settleAcceptedInputs()) !== "drained")
+      throw new Error("STOP: maintenance accepted inputs are not settled");
+  }
+
   // End the client pools once nothing needs them any more. Without this the
   // process exit leaves the pooled backends to PostgreSQL's own TCP keepalive
   // reaping, and a restart loop can pile up enough of them to hit
@@ -172,6 +195,8 @@ export async function finalizeServerShutdown(input: {
       await input.closeDatabase();
     } catch (err) {
       input.log.error({ err, signal }, "Database client shutdown failed");
+      if (input.strictAcceptedInputs)
+        throw err;
     }
   }
 
@@ -181,6 +206,8 @@ export async function finalizeServerShutdown(input: {
       await input.stopEmbeddedPostgres();
     } catch (err) {
       input.log.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+      if (input.strictAcceptedInputs)
+        throw err;
     }
   }
 

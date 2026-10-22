@@ -297,7 +297,10 @@ export function instanceSettingsRoutes(db: Db) {
 
   router.get("/instance/task-drain", async (req, res) => {
     assertBoardOrgAccess(req);
-    res.json(heartbeat.getTaskDrainStatus());
+    const status = heartbeat.getTaskDrainStatus();
+    if (req.query.queueStartedAt !== undefined)
+      status.wakeQueue = await heartbeat.getTaskDrainQueueStatus(String(req.query.queueStartedAt));
+    res.json(status);
   });
 
   router.post(
@@ -405,6 +408,10 @@ export function instanceSettingsRoutes(db: Db) {
       publishActivitiesBestEffort(postCommitActivityPublications, "instance.task_drain.stopped");
       return wasActive;
     });
+    // Releasing the admission gate must also re-admit the queued runs the
+    // drain held back; without this the retained wakes wait for the next
+    // unrelated trigger instead of resuming on stop.
+    await heartbeat.resumeQueuedRuns();
     res.json({ wasActive });
   });
 

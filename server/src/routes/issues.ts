@@ -17448,6 +17448,16 @@ export function issueRoutes(
     res.json(await filterIssuesForActor(req, conversations));
   });
 
+  // New conversation input is explicitly not accepted during a native
+  // drain; an existing idempotent receipt still takes its original path.
+  function assertNewConversationInputAccepted() {
+    if (heartbeat.getTaskDrainStatus().draining) {
+      throw new HttpError(503, "暂不受理，请稍后重发", {
+        code: "maintenance_not_accepted", accepted: false,
+      });
+    }
+  }
+
   // GET stays read-only. POST resolves the single chat on explicit add or first send/upload.
   for (const method of ["get", "post"] as const) {
     router[method]("/companies/:companyId/chats/:agentRef", async (req, res) => {
@@ -17462,6 +17472,7 @@ export function issueRoutes(
       const existing = await svc.getConversation(companyId, agent.id, req.actor.userId);
       if (existing && !(await assertIssueReadAllowed(req, res, existing))) return;
       if (existing || method === "get") { res.json(existing); return; }
+      assertNewConversationInputAccepted();
       const issue = await svc.create(companyId, {
         title: `Chat with ${agent.name}`, assigneeAgentId: agent.id,
         conversationAgentId: agent.id, conversationUserId: req.actor.userId,
@@ -17504,6 +17515,8 @@ export function issueRoutes(
             eq(issueComments.issueId, issue.id), eq(issueComments.authorUserId, userId),
             eq(issueComments.clientRequestId, req.body.clientRequestId),
           ));
+          if (!existing)
+            assertNewConversationInputAccepted();
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);

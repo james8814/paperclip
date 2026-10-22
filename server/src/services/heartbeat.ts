@@ -1424,6 +1424,42 @@ export function getTaskDrainStatus(): {
   };
 }
 
+// Counts only describe queue delivery; they are never a substitute for real
+// product acceptance. Unknown or failed rows keep the stop pending.
+function projectTaskDrainQueueStatus(startedAt: string, rows: Array<{ status: string; runStatus: string | null; count: number }>) {
+  let total = 0, pending = 0, resumed = 0, lost = 0, unknown = 0;
+  for (const row of rows) {
+    const count = Number(row.count);
+    if (!Number.isSafeInteger(count) || count < 0)
+      return { startedAt, complete: false, retained: false, resumed: false };
+    total += count;
+    if (["skipped", "failed", "cancelled"].includes(row.status)) lost += count;
+    else if (["claimed", "completed", "coalesced", "queued"].includes(row.status) &&
+      ["running", "succeeded"].includes(row.runStatus)) resumed += count;
+    else if (row.status === "queued" && row.runStatus === "queued" ||
+      row.status === "deferred_issue_execution" && row.runStatus === null) pending += count;
+    else unknown += count;
+  }
+  return { startedAt, complete: true, total, pending, delivered: resumed, lost, unknown,
+    retained: lost === 0 && unknown === 0, resumed: pending === 0 && lost === 0 && unknown === 0 };
+}
+
+// Aggregate over the only native persistent table for this batch. Returns
+// counts only: no ids, actors, inputs, errors, or contexts.
+export async function getTaskDrainQueueStatus(startedAt: string) {
+  if (typeof startedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(startedAt) ||
+    !Number.isFinite(Date.parse(startedAt)))
+    throw new HttpError(400, "Invalid task-drain queue scope");
+  const rows = await db.select({ status: agentWakeupRequests.status,
+    runStatus: heartbeatRuns.status, count: sql`count(*)::int` })
+    .from(agentWakeupRequests)
+    .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, agentWakeupRequests.runId),
+      eq(heartbeatRuns.companyId, agentWakeupRequests.companyId), eq(heartbeatRuns.agentId, agentWakeupRequests.agentId)))
+    .where(sql`${agentWakeupRequests.payload} #>> '{taskDrainAdmission,startedAt}' = ${startedAt}`)
+    .groupBy(agentWakeupRequests.status, heartbeatRuns.status);
+  return projectTaskDrainQueueStatus(startedAt, rows);
+}
+
 const INLINE_BASE64_IMAGE_DATA_RE =
   /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
@@ -19721,8 +19757,7 @@ export function heartbeatService(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ),
-        sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
-
+        sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
         and(
           eq(agentWakeupRequests.source, "assignment"),
           inArray(agentWakeupRequests.reason, [
@@ -19740,7 +19775,7 @@ export function heartbeatService(
           ]),
         ),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
-        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined)))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
       const savedIssue = await getIssueExecutionContext(wake.companyId, String(wake.payload?.issueId));
@@ -27081,6 +27116,7 @@ export function heartbeatService(
     if (payload) {
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
+      delete payload.taskDrainAdmission;
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -27319,6 +27355,18 @@ export function heartbeatService(
         reason: schedulingSuppression.reason,
       });
       return null;
+    }
+
+    // New input arriving during a drain is admitted into the durable queue
+    // with a stamped admission scope instead of being injected into a live
+    // run that is still settling; coalescing is disabled so each admitted
+    // input keeps its own receipt under the native queue.
+    const admissionDrain = readTaskDrain(new Date());
+    if (admissionDrain) {
+      opts = { ...opts, allowRunCoalescing: false };
+      payload = { ...(payload ?? {}), taskDrainAdmission: {
+        startedAt: admissionDrain.startedAt.toISOString(),
+      } };
     }
 
     const worktreeExecutionCutoff =
@@ -28730,7 +28778,7 @@ export function heartbeatService(
                   contextSnapshot: activeExecutionRun.contextSnapshot,
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
-                allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
+                allowRunCoalescing: isConversation(issue) || readTaskDrain(new Date()) ? false : opts.allowRunCoalescing,
                 durableReceipt: durableRequest
                   ? {
                       id: durableRequest.id,
@@ -29198,7 +29246,7 @@ export function heartbeatService(
       });
     // Unscoped manual wakes need their own receipt and execution identity too.
     const rawCoalescedTarget =
-      opts.allowRunCoalescing === false || opts.manualUserWake
+      opts.allowRunCoalescing === false || opts.manualUserWake || readTaskDrain(new Date())
         ? null
         : (sameScopeQueuedRun ??
           sameScopeScheduledRetryRun ??
@@ -30609,6 +30657,7 @@ export function heartbeatService(
     startTaskDrain,
     stopTaskDrain,
     getTaskDrainStatus,
+    getTaskDrainQueueStatus,
     computeTaskDrain,
     applyTaskDrain,
 
