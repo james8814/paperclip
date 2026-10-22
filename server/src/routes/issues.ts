@@ -13575,7 +13575,8 @@ export function issueRoutes(
         !!existing.createdByUserId &&
         nextAssigneeUserId === existing.createdByUserId;
 
-      if (assigneeWillChange && actor.actorType === "agent" &&
+      // Only a validated stage decision may hand off with queued replies for the original audience.
+      if (assigneeWillChange && !(transition.workflowControlledAssignment && transition.decision) && actor.actorType === "agent" &&
           existing.assigneeAgentId === actor.agentId && updateFields.status === "in_review" &&
           await hasQueuedInteractionResponse(db, existing.companyId, existing.id, existing.assigneeAgentId)) {
         throw conflict("The user already responded. Keep the current assignee so the queued response can continue after this run.", {
