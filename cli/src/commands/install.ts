@@ -344,6 +344,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
+    // npm honors overrides only at the install root, not inside packed dependencies.
+    const rootPackage = JSON.parse(fs.readFileSync(path.join(checkoutPath, "package.json"), "utf8")) as { overrides?: Record<string, unknown> };
+    if (rootPackage.overrides && Object.keys(rootPackage.overrides).length > 0) {
+      fs.mkdirSync(stagedPayload, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(stagedPayload, "package.json"), `${JSON.stringify({ private: true, overrides: rootPackage.overrides }, null, 2)}\n`);
+    }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);

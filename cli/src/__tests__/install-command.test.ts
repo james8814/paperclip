@@ -120,6 +120,7 @@ describe("managed install commands", () => {
         fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "skill");
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "package.json"), JSON.stringify({ overrides: { "zod@^4.4.3": "4.4.3" } }));
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
@@ -149,7 +150,7 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
-      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; expect(JSON.parse(fs.readFileSync(path.join(prefix, "package.json"), "utf8")).overrides).toEqual({ "zod@^4.4.3": "4.4.3" }); const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.cpSync(args[1], args[2], { recursive: true });
         return { stdout: "", stderr: "" };

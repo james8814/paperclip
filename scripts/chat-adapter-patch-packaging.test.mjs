@@ -120,3 +120,15 @@ test("release selection includes every chat runtime patch and the existing ACPX 
     /installed @discordjs\/ws@1\.2\.4/,
   );
 });
+
+// Each bundled staging directory is an independent npm project.
+test("bundled staging carries root npm policy without publishing or mutating it", () => {
+  const published = { dependencies: { acpx: "0.13.1", zod: "^4.4.3" }, overrides: { other: "1.0.0" } };
+  const policy = { "zod@^4.4.3": "4.4.3" };
+  const installed = createBundledInstallManifest(published, ["acpx"], policy);
+  assert.deepEqual(installed.dependencies, { acpx: "0.13.1" });
+  assert.deepEqual(installed.overrides, { other: "1.0.0", ...policy });
+  assert.deepEqual(published.overrides, { other: "1.0.0" });
+  installed.overrides.other = "2.0.0";
+  assert.equal(published.overrides.other, "1.0.0");
+});

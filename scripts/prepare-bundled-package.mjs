@@ -31,11 +31,14 @@ export function materializePublishManifest(pkg) {
   return publishManifest;
 }
 
-export function createBundledInstallManifest(publishManifest, bundledDependencies) {
+export function createBundledInstallManifest(publishManifest, bundledDependencies, npmOverrides = {}) {
   const bundledDependencyNames = new Set(bundledDependencies);
   const installManifest = structuredClone(publishManifest);
 
   delete installManifest.devDependencies;
+  if (Object.keys(npmOverrides).length > 0) {
+    installManifest.overrides = { ...installManifest.overrides, ...npmOverrides };
+  }
 
   for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
     if (!installManifest[section]) continue;
@@ -157,7 +160,8 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
   const publishManifest = materializePublishManifest(sourcePackage);
-  const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
+  const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
+  const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies, rootPackage.overrides);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
   execFileSync(
