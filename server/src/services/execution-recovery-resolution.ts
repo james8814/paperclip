@@ -50,6 +50,7 @@ export async function verifyNeverStartedRecovery(input: {
   recoveryAction: typeof issueRecoveryActions.$inferSelect;
   verificationOnly: true;
   replayed?: true;
+  chatRetry?: undefined;
 }> {
   const { db, task, actionId, verification, sourceIssueStatus, actorId, resolutionNote } = input;
   const reject = (reason: string) => {

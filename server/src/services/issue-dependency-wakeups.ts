@@ -295,6 +295,7 @@ export async function findCoveringIssueBlockersResolvedWakeForStateKey(
   if (typeof input.idempotencyKey !== "string" ||
     !input.idempotencyKey.startsWith(`${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:state:`))
     return null;
+  const idempotencyKey = input.idempotencyKey;
   const rows = await db
     .select({
       id: agentWakeupRequests.id,
@@ -306,13 +307,13 @@ export async function findCoveringIssueBlockersResolvedWakeForStateKey(
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
-        eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
         input.excludeWakeupRequestId ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId) : undefined,
       ),
     );
   const covering = rows.find((row) =>
     wakeCoversIssueBlockersResolvedReadyState(row, {
-      cycleKey: input.idempotencyKey,
+      cycleKey: idempotencyKey,
       oldStateKey: null,
       legacyKeys: new Set(),
       blockedTransitionAt: null,

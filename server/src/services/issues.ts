@@ -1994,6 +1994,7 @@ type IssueWakeDiagnosticsWakeRequestRow = {
   claimedAt: Date | null;
   finishedAt: Date | null;
   error: string | null;
+  payload: unknown;
 };
 type IssueWakeDiagnosticsActivityRow = {
   action: string;
@@ -4844,6 +4845,7 @@ async function listIssueReviewAttentionMap(
 }
 
 const issueListSelect = {
+  blockedNotificationState: issues.blockedNotificationState,
   externalConversationState: externalConversationStateSql(),
   conversationAgentId: issues.conversationAgentId,
   conversationUserId: issues.conversationUserId,
@@ -8971,6 +8973,7 @@ export function issueService(db: Db) {
               wake.claimed_at AS "claimedAt",
               wake.finished_at AS "finishedAt",
               wake.error,
+              wake.payload,
               row_number() OVER (
                 PARTITION BY ${wakeTargetIssueIdSql}
                 ORDER BY wake.requested_at DESC, wake.created_at DESC

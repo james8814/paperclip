@@ -1947,7 +1947,7 @@ async function startServerWithDatabaseTeardown(
     // against the persisted double-zero state.
     const maintenanceStatus = heartbeat?.getTaskDrainStatus();
     const maintenanceDrain = maintenanceStatus?.draining === true;
-    if (maintenanceDrain && !heartbeat.getTaskDrainStatus().quiescent) {
+    if (maintenanceDrain && !heartbeat?.getTaskDrainStatus().quiescent) {
       logger.error({ signal }, "STOP: maintenance requires natural native quiescence before shutdown");
       return;
     }

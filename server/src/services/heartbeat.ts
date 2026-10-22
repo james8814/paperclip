@@ -1445,20 +1445,6 @@ function projectTaskDrainQueueStatus(startedAt: string, rows: Array<{ status: st
 }
 
 // Aggregate over the only native persistent table for this batch. Returns
-// counts only: no ids, actors, inputs, errors, or contexts.
-export async function getTaskDrainQueueStatus(startedAt: string) {
-  if (typeof startedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(startedAt) ||
-    !Number.isFinite(Date.parse(startedAt)))
-    throw new HttpError(400, "Invalid task-drain queue scope");
-  const rows = await db.select({ status: agentWakeupRequests.status,
-    runStatus: heartbeatRuns.status, count: sql`count(*)::int` })
-    .from(agentWakeupRequests)
-    .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, agentWakeupRequests.runId),
-      eq(heartbeatRuns.companyId, agentWakeupRequests.companyId), eq(heartbeatRuns.agentId, agentWakeupRequests.agentId)))
-    .where(sql`${agentWakeupRequests.payload} #>> '{taskDrainAdmission,startedAt}' = ${startedAt}`)
-    .groupBy(agentWakeupRequests.status, heartbeatRuns.status);
-  return projectTaskDrainQueueStatus(startedAt, rows);
-}
 
 const INLINE_BASE64_IMAGE_DATA_RE =
   /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
@@ -19722,6 +19708,24 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // counts only: no ids, actors, inputs, errors, or contexts. Lives inside the
+  // service factory: the queue projection reads the factory-scoped db handle.
+  function getTaskDrainQueueStatusImpl(startedAt: string) {
+    if (typeof startedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(startedAt) ||
+      !Number.isFinite(Date.parse(startedAt)))
+      throw new HttpError(400, "Invalid task-drain queue scope");
+    const rows = db.select({ status: agentWakeupRequests.status,
+      runStatus: heartbeatRuns.status, count: sql<number>`count(*)::int` })
+      .from(agentWakeupRequests)
+      .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, agentWakeupRequests.runId),
+        eq(heartbeatRuns.companyId, agentWakeupRequests.companyId), eq(heartbeatRuns.agentId, agentWakeupRequests.agentId)))
+      .where(sql`${agentWakeupRequests.payload} #>> '{taskDrainAdmission,startedAt}' = ${startedAt}`)
+      .groupBy(agentWakeupRequests.status, heartbeatRuns.status);
+    return rows.then((grouped) =>
+      projectTaskDrainQueueStatus(startedAt, grouped as Array<{ status: string; runStatus: string | null; count: number }>),
+    );
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19779,7 +19783,9 @@ export function heartbeatService(
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
       const savedIssue = await getIssueExecutionContext(wake.companyId, String(wake.payload?.issueId));
-      const executionKind = savedIssue ? classifyDeferredExecutionWake(wake, savedIssue) : null;
+      const executionKind = savedIssue
+        ? classifyDeferredExecutionWake(wake, savedIssue as Parameters<typeof classifyDeferredExecutionWake>[1])
+        : null;
       if (executionKind) {
         const savedAgent = await getAgent(wake.agentId);
         const invokable = savedAgent
@@ -19800,7 +19806,7 @@ export function heartbeatService(
           await db.update(agentWakeupRequests).set({
             payload: {
               ...parseObject(wake.payload),
-              executionWait: { reason: waitReason, agentReason: invokable.reason ?? null },
+              executionWait: { reason: waitReason, agentReason: (invokable as { reason?: string | null }).reason ?? null },
             },
             updatedAt: new Date(),
           }).where(and(
@@ -27944,7 +27950,7 @@ export function heartbeatService(
           // consumed wake for the same key suppresses the duplicate so only
           // one emission wins across processes.
           const coveringDependencyWake = reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
-            ? await findCoveringIssueBlockersResolvedWakeForStateKey(tx, {
+            ? await findCoveringIssueBlockersResolvedWakeForStateKey(tx as unknown as Db, {
               companyId: agent.companyId,
               idempotencyKey: opts.idempotencyKey,
               excludeWakeupRequestId: executionWaitRequestId ?? null,
@@ -28303,7 +28309,7 @@ export function heartbeatService(
             // scheduled slot. It was admitted under native coordination, and
             // later promotion or claim paths re-check the card and the
             // remaining gates under their own locks.
-            if (!issueCancelled && (await isPendingInteractionAddresseeRetry(tx, issue, scheduledRun))) {
+            if (!issueCancelled && (await isPendingInteractionAddresseeRetry(tx as unknown as Db, issue, scheduledRun))) {
               return false;
             }
 
@@ -28449,7 +28455,7 @@ export function heartbeatService(
             // A pending-card addressee retry that already held the lock under
             // native coordination must not be cleared from here; the later
             // enqueue path re-checks the card before reusing the lock.
-            !(await isPendingInteractionAddresseeRetry(tx, issue, activeExecutionRun))
+            !(await isPendingInteractionAddresseeRetry(tx as unknown as Db, issue, activeExecutionRun))
           ) {
             const cancelled = await tx
               .update(heartbeatRuns)
@@ -30657,7 +30663,7 @@ export function heartbeatService(
     startTaskDrain,
     stopTaskDrain,
     getTaskDrainStatus,
-    getTaskDrainQueueStatus,
+    getTaskDrainQueueStatus: (startedAt: string) => getTaskDrainQueueStatusImpl(startedAt),
     computeTaskDrain,
     applyTaskDrain,
 

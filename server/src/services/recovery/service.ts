@@ -2062,8 +2062,8 @@ export function recoveryService(
       issueStateGuard: {
         statuses: state.status === "changes_requested" ? ["in_progress"] : ["in_review"],
         assigneeAgentId: participantAgentId,
-        statusVersion: issue.statusVersion,
-        executionStageId: state.currentStageId,
+        statusVersion: issue.statusVersion ?? undefined,
+        executionStageId: state.currentStageId ?? undefined,
         executionStateStatus: state.status,
         requireNoAgentIssueRun: true,
         agentIssueRunCreatedAtGte: receipt.requestedAt,
@@ -2154,6 +2154,8 @@ export function recoveryService(
     attribution: string,
   ): Promise<{ run: LatestIssueRun | null; outcome: string }> {
     const declined = (outcome: string) => ({ run: null as LatestIssueRun | null, outcome });
+    if (!afterRun)
+      return declined("missing_after_run");
     if (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId))
       return declined("queued_wake");
     const recoveryContext = parseObject(afterRun?.contextSnapshot);
@@ -2180,8 +2182,8 @@ export function recoveryService(
       issueStateGuard: {
         statuses: ["in_review"],
         assigneeAgentId: participantAgentId,
-        statusVersion: issue.statusVersion,
-        executionStageId: state.currentStageId,
+        statusVersion: issue.statusVersion ?? undefined,
+        executionStageId: state.currentStageId ?? undefined,
         executionStateStatus: "pending",
         requireNoAgentIssueRun: true,
         agentIssueRunCreatedAtGte: new Date(new Date(afterRun.createdAt).getTime() + 1),
@@ -4992,7 +4994,7 @@ export function recoveryService(
             participantAgentId,
             participantRunId: participantLatestRunForRecovery?.id ?? null,
             participantRunStatus: participantLatestRunForRecovery?.status ?? null,
-            participantRunRetryReason: readNonEmptyString(participantRecoveryContextForBudget.retryReason),
+            participantRunRetryReason: readNonEmptyString(participantRecoveryContextForBudget?.retryReason),
             countCurrentRoundFailedRecoveries: currentRoundFailedRecoveryCount,
             recoveryAttempts,
             decision: "allow_current_round_recovery_before_invocation_budget",

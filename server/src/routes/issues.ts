@@ -1800,6 +1800,7 @@ function buildIssueWakeDiagnosticsResponse(input: {
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload: unknown;
   }>;
   activityRecords: Array<{
     action: string;
@@ -1897,6 +1898,7 @@ type IssueSubtreeDiagnosticWakeRequestRow = {
   claimedAt: Date | string | null;
   finishedAt: Date | string | null;
   error: string | null;
+  payload: unknown;
 };
 
 type IssueSubtreeDiagnosticActivityRow = {
@@ -9291,7 +9293,7 @@ export function issueRoutes(
           // restored-to-todo transition, no stage change, and no clearing of
           // other actions.
           return verifyNeverStartedRecovery({
-            db: tx,
+            db: tx as unknown as typeof db,
             task: lockedIssue,
             actionId,
             verification: neverStartedVerification,
@@ -14005,7 +14007,7 @@ export function issueRoutes(
                 eq(issueRows.id, blockedIssue.id),
                 eq(issueRows.companyId, blockedIssue.companyId),
                 eq(issueRows.status, "blocked"),
-                eq(issueRows.blockedTransitionAt, blockedIssue.blockedTransitionAt),
+                eq(issueRows.blockedTransitionAt, blockedIssue.blockedTransitionAt as Date),
                 sql`${issueRows.blockedNotificationState} = ${JSON.stringify(blockedIssue.blockedNotificationState)}::jsonb`,
               ),
             );

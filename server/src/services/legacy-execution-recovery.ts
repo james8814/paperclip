@@ -97,7 +97,7 @@ export function legacyExecutionNeedsReconciliation(
   // A review-participant recovery round is settled by the stage and status
   // version budget reconciliation, not by this generic branch; real business
   // runs keep the original reconciliation path.
-  const retryReason = run.retryReason ?? parseObject(run.contextSnapshot).retryReason;
+  const retryReason = (run as { retryReason?: string }).retryReason ?? parseObject(run.contextSnapshot).retryReason;
   if (retryReason === "execution_review_participant_recovery") return false;
   // Without an in-database verified receipt, a queue cancellation for these
   // ownership and reconciliation codes does not exempt itself.
@@ -152,11 +152,14 @@ function queueCancellationReceiptMatches(run: Partial<Run>, payload: unknown): b
   // reason receipt is a contradiction. When verification did not pass, the
   // original reason stays and the payload additionally carries that reason
   // plus the assessment recorded at cancellation time.
-  const sameDetails = (details: Record<string, unknown>) =>
-    !marked && (isDeepStrictEqual(payload, details) ||
-      (isDeepStrictEqual(payload, { ...details, reason: run.error, executionAssessment: (payload as Record<string, unknown>).executionAssessment }) &&
-        ["unknown", "execution_evidence"].includes((payload as Record<string, unknown>).executionAssessment?.kind as string) && nonEmpty((payload as Record<string, unknown>).executionAssessment?.reason) &&
-        Object.keys((payload as Record<string, unknown>).executionAssessment as Record<string, unknown>).length === 2));
+  const sameDetails = (details: Record<string, unknown>) => {
+    if (marked) return false;
+    if (isDeepStrictEqual(payload, details)) return true;
+    const assessment = (payload as Record<string, unknown>).executionAssessment as Record<string, unknown> | undefined;
+    return isDeepStrictEqual(payload, { ...details, reason: run.error, executionAssessment: assessment }) &&
+      ["unknown", "execution_evidence"].includes(assessment?.kind as string) && nonEmpty(assessment?.reason) &&
+      Object.keys(assessment ?? {}).length === 2;
+  };
   if (run.errorCode === "issue_assignee_changed") {
     const current = (payload as Record<string, unknown>).currentAssigneeAgentId;
     return ["Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
@@ -277,7 +280,7 @@ export async function assessLegacyExecutionEvidence(db: Db, run: Partial<Run>): 
   if (stopIds.length) {
     const holds = await db.select({ id: issueRecoveryActions.id, sourceIssueId: issueRecoveryActions.sourceIssueId,
       kind: issueRecoveryActions.kind, cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence })
-      .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, run.companyId!), inArray(issueRecoveryActions.id, [...new Set(stopIds)])));
+      .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, run.companyId!), inArray(issueRecoveryActions.id, [...new Set(stopIds)] as string[])));
     const issueId = parseObject(run.contextSnapshot).issueId;
     if (stopIds.some((id) => {
       const hold = holds.find((holdRow) => holdRow.id === id);

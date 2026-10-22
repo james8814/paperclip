@@ -116,6 +116,8 @@ export interface WakeQueueTransaction {
     companyId: string; issueId: string; excludedWakeIds?: string[]; excludedAgentId?: string;
     /** Read this agent's wakes before others, then in request order. */
     preferredAgentId?: string;
+    /** Precise single-wake release scope (stage handoff). */
+    deferredExecutionWakeId?: string | null;
   }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;

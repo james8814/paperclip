@@ -37,6 +37,7 @@ const ISSUE: IssueSnapshot = {
   companyId: "company-1",
   identifier: "ISSUE-1",
   status: "in_progress",
+  statusVersion: 1,
   assigneeAgentId: "finishing-agent",
   assigneeUserId: null,
   hiddenAt: null,
@@ -99,6 +100,7 @@ function createFakeHost(overrides: Partial<WakeQueueHost> = {}): WakeQueueHost {
 function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): WakeQueueTransaction {
   return {
     findInvokableAgent: vi.fn(async () => AGENT),
+    hasReviewRecoveryWaitPath: vi.fn(async () => false),
     isCompletedOnboardingHandoffWake: vi.fn(async () => false),
     findNextDeferredWake: vi.fn(async () => null),
     getQueuedCommentLiveness: vi.fn(async () => ({ liveNonSelfCommentIds: [], containedSelfAuthoredComment: false })),

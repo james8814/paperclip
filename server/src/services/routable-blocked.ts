@@ -93,7 +93,7 @@ export function planAgentUnblockNotification(
   return {
     kind: "enqueue",
     idempotencyKey: `issue-unblock-content:${issue.id}:${state.generation}:${fingerprint}`,
-    payload: { ...payload, issueId: issue.id, action: descriptor.action,
+    payload: { ...payload, issueId: issue.id, action: descriptor!.action,
       unblockFingerprint: fingerprint, unblockGeneration: state.generation },
   };
 }

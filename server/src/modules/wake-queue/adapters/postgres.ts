@@ -634,7 +634,7 @@ function buildTransaction(
         )
         .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
         .limit(1);
-      if (!previous || !Object.keys(details).every((key) => previous.details?.[key] === details[key]))
+      if (!previous || !Object.keys(details).every((key) => (previous.details as Record<string, unknown>)?.[key] === details[key]))
         await tx.insert(activityLog).values({
           companyId,
           actorType: "system",
@@ -1249,7 +1249,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           run.status === "cancelled" &&
           run.errorCode === "issue_reassigned" &&
           run.resultJson?.reassignmentStopConfirmed === true &&
-          run.resultJson?.executionCancellation?.state === "acknowledged" &&
+          (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged" &&
           !(await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run));
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,

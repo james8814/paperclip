@@ -298,8 +298,11 @@ export function instanceSettingsRoutes(db: Db) {
   router.get("/instance/task-drain", async (req, res) => {
     assertBoardOrgAccess(req);
     const status = heartbeat.getTaskDrainStatus();
-    if (req.query.queueStartedAt !== undefined)
-      status.wakeQueue = await heartbeat.getTaskDrainQueueStatus(String(req.query.queueStartedAt));
+    if (req.query.queueStartedAt !== undefined) {
+      const wakeQueue = await heartbeat.getTaskDrainQueueStatus(String(req.query.queueStartedAt));
+      res.json({ ...status, wakeQueue });
+      return;
+    }
     res.json(status);
   });
 

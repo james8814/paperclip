@@ -180,7 +180,7 @@ export function classifyDeferredExecutionWake(
     status: string;
     assigneeAgentId: string | null;
     conversationAgentId?: string | null;
-    executionState: import("@paperclipai/shared").IssueExecutionState | null;
+    executionState: unknown;
   },
 ): "stage" | "continuation" | null {
   const payload = wake.payload ?? {};
