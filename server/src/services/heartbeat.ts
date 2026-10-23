@@ -63,6 +63,7 @@ import {
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import { resolveVerifiedRunSourceCommentId } from "./run-source-comment.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import {
@@ -13024,7 +13025,7 @@ export function heartbeatService(
         type: "heartbeat.run.status",
         payload: buildHeartbeatRunStatusLiveEventPayload(updated),
       });
-      publishRunLifecyclePluginEvent(updated);
+      await publishRunLifecyclePluginEvent(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
     }
 
@@ -13131,7 +13132,7 @@ export function heartbeatService(
         type: "heartbeat.run.status",
         payload: buildHeartbeatRunStatusLiveEventPayload(updated),
       });
-      publishRunLifecyclePluginEvent(updated);
+      await publishRunLifecyclePluginEvent(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null, failureReport);
       return { run: updated, updated: true as const };
     }
@@ -13230,10 +13231,17 @@ export function heartbeatService(
     return terminalRun ?? run;
   }
 
-  function publishRunLifecyclePluginEvent(
+  async function publishRunLifecyclePluginEvent(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
+    const sourceCommentId = run.status === "running"
+      ? await resolveVerifiedRunSourceCommentId(db, run).catch((error) => {
+          logger.warn({ err: error, runId: run.id }, "failed to verify run source comment");
+          return null;
+        })
+      : null;
     publishRunLifecyclePluginEventData({
+      sourceCommentId,
       companyId: run.companyId,
       runId: run.id,
       agentId: run.agentId,
@@ -13249,6 +13257,7 @@ export function heartbeatService(
   }
 
   function publishRunLifecyclePluginEventData(run: {
+    sourceCommentId?: string | null;
     companyId: string;
     runId: string;
     agentId: string;
@@ -13290,6 +13299,7 @@ export function heartbeatService(
         error: run.error ?? null,
         errorCode: run.errorCode ?? null,
         issueId: run.issueId,
+        sourceCommentId: run.sourceCommentId ?? null,
         startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
         finishedAt: run.finishedAt
           ? new Date(run.finishedAt).toISOString()
@@ -17435,7 +17445,7 @@ export function heartbeatService(
             error: settled.error,
           },
         });
-        publishRunLifecyclePluginEvent(settled);
+        await publishRunLifecyclePluginEvent(settled);
         if (stage === "dispatch")
           await finalizeAgentStatus(settled.agentId, "cancelled");
       }
@@ -18002,7 +18012,7 @@ export function heartbeatService(
             : null,
         },
       });
-      publishRunLifecyclePluginEvent(queuedCommentClaim.run);
+      await publishRunLifecyclePluginEvent(queuedCommentClaim.run);
       // Fire-and-forget: nothing else in this path depends on the emission,
       // so it must not delay the return.
       void emitAgentTaskRun(db, queuedCommentClaim.run);
@@ -18060,7 +18070,7 @@ export function heartbeatService(
           : null,
       },
     });
-    publishRunLifecyclePluginEvent(claimed);
+    await publishRunLifecyclePluginEvent(claimed);
 
     if (!nativeReviewContext) {
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
