@@ -282,7 +282,8 @@ function formatSqlValue(
   const val = columnName && nullifiedColumns.has(columnName) ? null : rawValue;
   if (val === null || val === undefined) return "NULL";
   if (dataType === "json" || dataType === "jsonb") {
-    return formatSqlLiteral(JSON.stringify(val));
+    // JSON columns are selected as text so JavaScript cannot round their numbers.
+    return formatSqlLiteral(String(val));
   }
   if (typeof val === "boolean") return val ? "true" : "false";
   if (typeof val === "number") return String(val);
@@ -954,8 +955,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         continue;
       }
 
+      const projections = cols.map((col) =>
+        col.data_type === "json" || col.data_type === "jsonb"
+          ? `${quoteIdentifier(col.column_name)}::text`
+          : quoteIdentifier(col.column_name),
+      ).join(", ");
       const rowCursor = sql
-        .unsafe(`SELECT * FROM ${qualifiedTableName}`)
+        .unsafe(`SELECT ${projections} FROM ${qualifiedTableName}`)
         .values()
         .cursor(BACKUP_DATA_CURSOR_ROWS) as AsyncIterable<unknown[][]>;
       for await (const rows of rowCursor) {

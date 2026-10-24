@@ -4,6 +4,7 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
+import { DEFAULT_BACKUP_RETENTION } from "@paperclipai/shared";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
@@ -75,6 +76,28 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("preserves JSON numeric precision and null semantics in JavaScript backups", async () => {
+    const source = await createTempDatabase();
+    const restored = await createSiblingDatabase(source, "json_precision_restore");
+    const dir = createTempDir("paperclip-json-precision-");
+    const sql = postgres(source, { max: 1, onnotice: () => {} });
+    const target = postgres(restored, { max: 1, onnotice: () => {} });
+    try {
+      await sql.unsafe(`CREATE TABLE precision_fixture(id integer PRIMARY KEY, j json, b jsonb, secret jsonb)`);
+      const literals = [null, "null", '"a string"', '{"n":9007199254740993123,"decimal":0.123456789012345678901}',
+        '[9007199254740993123,null,"text",true]'];
+      for (const [id, literal] of literals.entries()) {
+        await sql`INSERT INTO precision_fixture VALUES (${id},${literal}::text::json,${literal}::text::jsonb,'{"secret":true}')`;
+      }
+      const before = await sql`SELECT id,j::text,b::text FROM precision_fixture ORDER BY id`;
+      const backup = await runDatabaseBackup({ connectionString: source, backupDir: dir, backupEngine: "javascript", retention: DEFAULT_BACKUP_RETENTION,
+        nullifyColumns: { "public.precision_fixture": ["secret"] } });
+      await runDatabaseRestore({ connectionString: restored, backupFile: backup.backupFile });
+      expect(await target`SELECT id,j::text,b::text FROM precision_fixture ORDER BY id`).toEqual(before);
+      expect((await target`SELECT count(*)::int AS n FROM precision_fixture WHERE secret IS NOT NULL`)[0]?.n).toBe(0);
+    } finally { await sql.end(); await target.end(); }
+  }, 30_000);
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
