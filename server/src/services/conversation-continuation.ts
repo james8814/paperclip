@@ -1,8 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
-import { readProcessStartedAt } from "./hot-restart.js";
+import { readProcessStartedAt, runProcessCommand } from "./hot-restart.js";
 
 // Mirrors upstream PR #16291 (services/execution-identity.ts): coerce run
 // evidence text to a canonical uuid before comparing it with uuid columns, so
@@ -111,19 +109,20 @@ function processMayBeAlive(pid: number): boolean {
   }
 }
 
-const execFileAsync = promisify(execFile);
-
 // Adapted from upstream PR #14728: a recycled process-group id keeps answering
 // kill(0), so group liveness needs the members' start times, not the signal
 // result. Unreadable membership returns null and every caller stays
 // conservative.
 async function processGroupMembers(groupId: number): Promise<Array<{ pid: number; startedAt: string }> | null> {
   if (process.platform === "win32") return null;
-  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,pgid=,lstart="], { timeout: 1_500 });
+  const stdout = await runProcessCommand("ps", ["-axo", "pid=,pgid=,lstart="]);
   const members: Array<{ pid: number; startedAt: string }> = [];
   for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-    if (!match || Number(match[2]) !== groupId) continue;
+    // A skipped malformed row could hide a surviving old member.
+    if (!match) return null;
+    if (Number(match[2]) !== groupId) continue;
     const startedAt = new Date(match[3]).toISOString();
     members.push({ pid: Number(match[1]), startedAt });
   }
@@ -160,17 +159,25 @@ export async function persistedConversationProcessLiveness(
     }
   }
   let groupAlive = run.processGroupId !== null && probes.isAlive(-run.processGroupId);
-  if (groupAlive && pidReused && run.processGroupId === run.processPid && probes.groupMembers) {
-    // A new leader whose other members all started later proves that this is a
-    // different group. ps reports whole seconds, so a member from the same
-    // second may predate the leader. Missing or unreadable membership keeps the
-    // historical hold.
+  if (groupAlive && !pidAlive && probes.groupMembers) {
     const members = await probes.groupMembers(run.processGroupId!).catch(() => null);
     const leader = members?.find((member) => member.pid === run.processGroupId);
     const leaderStartedAt = leader ? new Date(leader.startedAt).getTime() : NaN;
-    if (leader && members!.every((member) =>
-      member.pid === leader.pid || new Date(member.startedAt).getTime() > leaderStartedAt))
+    const finishedAt = run.finishedAt?.getTime() ?? NaN;
+    // Preserve #14728's equal-ID release, including leaders born before the
+    // run ended. Newly covered cases require a strictly later terminal second.
+    const existingReusedLeader = pidReused && run.processGroupId === run.processPid;
+    const newGroupAfterRun = Number.isFinite(finishedAt) &&
+      Math.floor(leaderStartedAt / 1_000) > Math.floor(finishedAt / 1_000);
+    // Unknown/incomplete membership and old or same-second descendants hold.
+    if (leader && Number.isFinite(leaderStartedAt) &&
+      (existingReusedLeader || newGroupAfterRun) &&
+      new Set(members!.map((member) => member.pid)).size === members!.length &&
+      members!.every((member) => Number.isInteger(member.pid) && member.pid > 0 &&
+        Number.isFinite(new Date(member.startedAt).getTime()) &&
+        (member.pid === leader.pid || new Date(member.startedAt).getTime() > leaderStartedAt))) {
       groupAlive = false;
+    }
   }
   return { pidAlive, groupAlive };
 }

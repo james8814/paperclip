@@ -156,7 +156,7 @@ function isProcessAlive(pid: number) {
   }
 }
 
-function runProcessCommand(command: string, args: string[]) {
+export function runProcessCommand(command: string, args: string[]) {
   return new Promise<string>((resolve, reject) => {
     execFile(
       command,
@@ -165,6 +165,8 @@ function runProcessCommand(command: string, args: string[]) {
         encoding: "utf8",
         timeout: 1_500,
         windowsHide: true,
+        // lstart is parsed as a date; only ps needs a stable output locale.
+        ...(command === "ps" ? { env: { ...process.env, LC_ALL: "C", LANG: "C" } } : {}),
       },
       (error, stdout) => {
         if (error) reject(error);
